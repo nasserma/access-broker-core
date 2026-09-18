@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Sync
+        run: uv sync --dev
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Tests with coverage (100% stmt+branch on the wall components)
+        run: uv run pytest -q --cov=access_broker_core --cov-branch --cov-report=term-missing
+      - name: Coverage gate
+        run: uv run pytest -q --cov=access_broker_core --cov-branch --cov-fail-under=100 2>/dev/null || uv run coverage report --fail-under=100
