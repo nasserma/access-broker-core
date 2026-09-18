@@ -132,7 +132,15 @@ class PolicyRegistry:
         raising PolicyError on hostile input). classify: optional
         custom classifier; default reads the table with unknown ->
         GATED (fail-closed)."""
-        self.operation_class = dict(operation_class)
+        # Coerce table values to THIS module's OperationClass: brokers
+        # register their own enum instances and the value vocabulary is
+        # identical ("read"/"gated"), but check() compares identity. The
+        # registry is the seam boundary, so enum identity is normalized
+        # HERE, once, at construction.
+        self.operation_class = {
+            op: OperationClass(cls.value) if hasattr(cls, "value") else cls
+            for op, cls in operation_class.items()
+        }
         self.backends = frozenset(backends)
         self._normalize = normalize_resource
         if classify is not None:
