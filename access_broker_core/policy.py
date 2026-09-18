@@ -165,6 +165,12 @@ class PolicyRegistry:
     def classify(self, operation: str) -> OperationClass:
         return self._classify(operation)
 
+    def declared_operations(self) -> list[str]:
+        """The registered operation vocabulary, sorted: the validation
+        set for grant items and baseline definitions alike (one table,
+        one custody - the S4-1 generalization's landed shape)."""
+        return sorted(self.operation_class)
+
     def classify_tier(self, operation: str) -> int:
         """Map an operation to its tier: 1 (baseline) or 2 (brokered)."""
         return 1 if self._classify(operation) is OperationClass.READ else 2
