@@ -36,8 +36,12 @@ Findings applied (each maps to a battery section in
 tests/test_baselines.py):
 
 - F-A: suspension indefinite by default; the zombie countermeasure is
-  the budget report, not a timer (max_suspension may SURFACE items;
-  it never revokes).
+  the budget report, not a timer. NOTE: no max_suspension mechanism is
+  implemented in this version — the design note's optional owner-set
+  timer (default OFF) was deliberately not built (an unimplemented
+  knob would be worse than none); the budget report is the SOLE zombie
+  countermeasure. last_used_at is likewise absent from the schema by
+  design: usage lives in the baseline_usage table (F-B's stance).
 - F-B: NO usage-based auto-renewal. At interval end the baseline
   converts to a reconfirmation request regardless of usage; usage data
   populates the request so the owner decides informed. The human is
