@@ -321,7 +321,10 @@ def verify_chain(path: Path | str) -> ChainResult:  # noqa: PLR0911 - fail-fast 
     (<path>.head). Returns ChainResult with ok=False and an error
     message naming the first broken line (1-indexed). A missing or
     mismatched checkpoint is a chain break: the log has lost its tail
-    or the checkpoint was tampered with."""  # noqa: PLR0911 - fail-fast walk
+    or the checkpoint was tampered with. A missing sidecar is itself a
+    chain break (the checkpoint mechanism is the truncation detector:
+    without it a truncated log would verify silently). An empty log
+    with no sidecar verifies (nothing has been written yet)."""  # noqa: PLR0911 - fail-fast walk
     p = Path(path)
     if not p.exists():
         return ChainResult(False, f"no such file: {p}")
@@ -345,20 +348,26 @@ def verify_chain(path: Path | str) -> ChainResult:  # noqa: PLR0911 - fail-fast 
     # Checkpoint comparison (see module docstring): the sidecar turns
     # silent truncation into a detectable break. Only compared AFTER the
     # full walk succeeds, so chain corruption is reported with a line
-    # number first.
+    # number first. A MISSING sidecar on a non-empty log is itself a
+    # chain break: without the sidecar, a truncated log verifies
+    # silently — the exact case this check exists to catch. (An empty
+    # log with no sidecar is a fresh file, not a truncation.)
     head_path = Path(str(p) + ".head")
-    if head_path.exists():
-        try:
-            head = json.loads(head_path.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            return ChainResult(False, "checkpoint unreadable")
-        if head.get("sha256") != prev:
-            return ChainResult(
-                False, "checkpoint mismatch: log truncated or checkpoint tampered"
-            )
-        if head.get("lines") != len(lines):
-            return ChainResult(
-                False,
-                f"checkpoint line count {head.get('lines')} != actual {len(lines)} (truncated?)",
-            )
+    if not head_path.exists():
+        if lines:
+            return ChainResult(False, "checkpoint missing: log truncated or sidecar removed")
+        return ChainResult(True, None, 0)
+    try:
+        head = json.loads(head_path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return ChainResult(False, "checkpoint unreadable")
+    if head.get("sha256") != prev:
+        return ChainResult(
+            False, "checkpoint mismatch: log truncated or checkpoint tampered"
+        )
+    if head.get("lines") != len(lines):
+        return ChainResult(
+            False,
+            f"checkpoint line count {head.get('lines')} != actual {len(lines)} (truncated?)",
+        )
     return ChainResult(True, None, len(lines))

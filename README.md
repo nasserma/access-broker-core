@@ -26,6 +26,12 @@ core, extracted from nextcloud-access-broker and groupware-access-broker
   (Matrix, Telegram, Teams, Signal shells) stay per-broker.
 - **`auth`** — RFC 9728/8707 OAuth 2.1 resource-server validation
   (HTTP transport) and constant-time bearer checks (stdio).
+- **`baselines`** — BaselineEngine: standing T0/T1 permission
+  reassessment (the nextcloud-access-broker design note rev 2,
+  implemented; the data broker consumes it).
+- **`custody`** — CustodyRegistry/CustodyClass: the machine-readable
+  custody-class declaration layer (S6-1); declarations are
+  refuse-to-start validated and ride every audit record.
 
 ## What is NOT in the core
 

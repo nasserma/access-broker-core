@@ -29,6 +29,14 @@ Format based on Keep a Changelog; versioning is SemVer.
   step-up) and constant-time static credential check with the
   empty-credential deny-by-default guard (from groupware-access-broker
   auth/).
+- `baselines`: BaselineEngine, standing T0/T1 permission
+  reassessment (implementation of the nextcloud-access-broker
+  baseline-permissions design note rev 2, landed during Stage 4; the
+  data broker is its natural consumer).
+- `custody`: CustodyRegistry / CustodyClass, the machine-readable
+  custody-class declaration layer (S6-1): per-backend declarations
+  refuse-to-start validated at boot, carried on every audit record
+  (from the smarthome S6-1 spec).
 
 ### Fixed (at extraction)
 
@@ -38,6 +46,11 @@ Format based on Keep a Changelog; versioning is SemVer.
 - Empty-credential deny-by-default in check_static_credential
   (hmac.compare_digest("", "") is True; the core owns the fail-closed
   invariant the source masked).
+- verify_chain sidecar blind spot (Stage 8 disposition): a log with
+  records but no `.head` checkpoint now verifies NOT-ok ("checkpoint
+  missing") instead of passing on chain-hash alone; fresh empty logs
+  (no records, no sidecar) still verify ok. Regression tests cover
+  both directions.
 
 ### Verified
 

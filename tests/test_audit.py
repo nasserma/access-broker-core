@@ -430,6 +430,25 @@ def test_verify_chain_detects_truncation(tmp_path):
     assert result.error
 
 
+def test_verify_chain_missing_checkpoint_is_error(tmp_path):
+    """A non-empty log whose .head sidecar is missing is a chain break:
+    without the sidecar a truncated log would verify silently."""
+    log = make_log(tmp_path)
+    record(log, resource="f")
+    head = tmp_path / "audit.log.head"
+    assert head.exists()
+    head.unlink()
+    result = verify_chain(tmp_path / "audit.log")
+    assert not result.ok
+    assert "checkpoint missing" in (result.error or "")
+
+
+def test_verify_chain_fresh_log_without_sidecar_is_ok(tmp_path):
+    """An empty log with no sidecar is a fresh file, not a truncation."""
+    (tmp_path / "audit.log").write_text("")
+    assert verify_chain(tmp_path / "audit.log").ok
+
+
 def test_verify_chain_detects_reordering(tmp_path):
     log = make_log(tmp_path)
     for i in range(3):
@@ -548,15 +567,18 @@ def test_corrupt_checkpoint_detected(tmp_path):
     assert "checkpoint unreadable" in (result.error or "")
 
 
-def test_missing_checkpoint_after_records_still_ok(tmp_path):
-    """A log without its checkpoint sidecar verifies by chain alone
-    (truncation then undetectable) - documented behavior."""
+def test_missing_checkpoint_after_records_is_error(tmp_path):
+    """A non-empty log whose checkpoint sidecar is missing is a chain
+    break: without the sidecar a truncated log verifies silently — the
+    exact case the checkpoint mechanism exists to catch (Stage 8
+    supervisory finding; supersedes the earlier by-chain-alone
+    behavior)."""
     log = make_log(tmp_path)
     record(log, resource="f")
     (tmp_path / "audit.log.head").unlink()
     result = verify_chain(tmp_path / "audit.log")
-    assert result.ok
-    assert result.lines == 1
+    assert not result.ok
+    assert "checkpoint missing" in (result.error or "")
 
 
 def test_checkpoint_tracks_line_count(tmp_path):
