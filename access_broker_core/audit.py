@@ -35,7 +35,7 @@ Goal contract requirements (unchanged from the reference):
 Record format (one JSON object per line, canonical key order):
   {"timestamp": ..., "account": ..., "backend": ..., "resource": ...,
    "operation": ..., "grant_id": ..., "decision": ..., "reason": ...,
-   "principal": ..., "prev_sha256": ..., "sha256": ...}
+   "principal": ..., "custody": ..., "prev_sha256": ..., "sha256": ...}
 
 The chain hash is computed over the record WITHOUT prev_sha256, so a
 record's own hash does not depend on the chain position of its writer,
@@ -64,6 +64,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from access_broker_core.custody import CustodyClass
+
 GENESIS = "0" * 64
 
 _CHAINED_FIELDS = (
@@ -76,6 +78,7 @@ _CHAINED_FIELDS = (
     "decision",
     "reason",
     "principal",
+    "custody",
 )
 
 #: Tier-2 lifecycle event types (goal contract D5): the values written in
@@ -85,6 +88,27 @@ _CHAINED_FIELDS = (
 LIFECYCLE_EVENTS = frozenset(
     {"submitted", "approved", "rejected", "revoked", "expired_notice", "executed", "refused"}
 )
+
+
+#: The recognized custody vocabulary (S6-1): the string values a
+#: record's ``custody`` field may carry. Anything else is refused
+#: before write.
+_CUSTODY_VALUES = frozenset(c.value for c in CustodyClass)
+
+
+def _check_custody_value(custody) -> None:
+    """Fail-closed vocabulary gate on the optional custody field: the
+    chain must never carry a custody statement outside the recognized
+    vocabulary. Runs BEFORE the entry is built, so a refused value
+    leaves no partial record behind. The enum member itself is
+    normalized by the caller."""
+    if custody is None or isinstance(custody, CustodyClass):
+        return
+    if not isinstance(custody, str) or custody not in _CUSTODY_VALUES:
+        raise ValueError(
+            f"refusing to record custody value {custody!r}: not a "
+            "recognized custody class (scoped | account_wide | unscopable)"
+        )
 
 
 class LogWriteError(Exception):
@@ -203,6 +227,7 @@ class AuditLog:
         _fail_inject: bool = False,
         backend: str | None = None,
         principal: str | None = None,
+        custody: str | CustodyClass | None = None,
     ) -> object:
         """Write the audit entry, flush, then run ``then``. Returns whatever
         ``then`` returns, or None when ``then`` is not given.
@@ -217,6 +242,15 @@ class AuditLog:
         principal. It is part of the chain hash but optional, so legacy
         lines still verify.
 
+        custody carries the custody class of the backend principal
+        (S6-1): the string value of a CustodyClass member ('scoped' |
+        'account_wide' | 'unscopable') or the member itself, normalized
+        at the seam. None means a caller that does not declare it (and
+        a legacy line that predates the field). It is part of the chain
+        hash but optional. Any OTHER string value is refused before
+        write (fail-closed: the chain must never carry a custody
+        statement outside the recognized vocabulary).
+
         For Tier-2 lifecycle entries, decision carries the event type
         (LIFECYCLE_EVENTS); each execution writes its intent entry
         BEFORE the backend call via ``then``.
@@ -226,6 +260,7 @@ class AuditLog:
         (also NOT run - and not written).
         """
         self._check_secrets(account, resource, operation, decision, reason)
+        _check_custody_value(custody)
 
         entry = {
             "timestamp": self._clock().isoformat(),
@@ -240,6 +275,10 @@ class AuditLog:
             entry["backend"] = backend
         if principal is not None:
             entry["principal"] = principal
+        if custody is not None:
+            entry["custody"] = (
+                custody.value if isinstance(custody, CustodyClass) else custody
+            )
         line_record = dict(entry)
         line_record["prev_sha256"] = self._prev_sha256
         line_record["sha256"] = hashlib.sha256(_chain_payload(entry).encode()).hexdigest()
