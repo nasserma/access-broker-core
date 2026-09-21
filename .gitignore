@@ -8,3 +8,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# local-only governance (publication rule)
+CHANGEOVER_*.md
+MIGRATION_NOTES.md
