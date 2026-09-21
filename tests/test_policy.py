@@ -56,11 +56,14 @@ _REGISTRY = None
 def _get_registry():
     global _REGISTRY
     if _REGISTRY is None:
-        import sys
 
-        sys.path.insert(
-            0, "HOME/GW"
-        )
+        from tests import _gw_path
+
+        if _gw_path.insert_groupware_path() is None:  # pragma: no cover
+            pytest.skip(
+                "groupware sibling checkout not available (set GROUPWARE_PATH)",
+                allow_module_level=False,
+            )
         from groupware_broker.policy import normalize_resource as gw_normalize
 
         _REGISTRY = _core_policy.PolicyRegistry(

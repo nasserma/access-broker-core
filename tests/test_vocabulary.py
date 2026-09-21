@@ -88,7 +88,7 @@ def test_baseline_validates_against_same_vocabulary(tmp_path: Path) -> None:
 
 def test_one_op_vocabulary_is_the_current_shape(tmp_path: Path) -> None:
     """Backward compatibility by construction: a one-op registry is a
-    valid registry (the groupware/smarthome shape)."""
+    valid registry (the groupware/automation shape)."""
     registry = PolicyRegistry(
         operation_class={"send": OperationClass.GATED},
         backends=frozenset({"imap"}),

@@ -14,7 +14,6 @@ from __future__ import annotations
 # --- S1 seam: gateway tests build the store with the groupware-semantics
 # registry (identical tables to what the groupware broker registers at boot),
 # so the ported batteries run verbatim against the core seam.
-import sys as _sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -32,10 +31,14 @@ from access_broker_core.gateways.logic import (
     parse_reply,
 )
 from access_broker_core.grants import GrantStore
+from tests import _gw_path  # noqa: E402 - dev-machine sibling resolution
 
-_sys.path.insert(
-    0, "HOME/GW"
-)
+_gw_resolved = _gw_path.insert_groupware_path()
+if _gw_resolved is None:
+    pytest.skip(
+        "groupware sibling checkout not available (set GROUPWARE_PATH)",
+        allow_module_level=True,
+    )
 from groupware_broker.policy import normalize_resource as _gw_norm  # noqa: E402
 
 from access_broker_core import policy as _cp  # noqa: E402

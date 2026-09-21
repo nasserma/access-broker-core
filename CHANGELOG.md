@@ -36,7 +36,7 @@ Format based on Keep a Changelog; versioning is SemVer.
 - `custody`: CustodyRegistry / CustodyClass, the machine-readable
   custody-class declaration layer (S6-1): per-backend declarations
   refuse-to-start validated at boot, carried on every audit record
-  (from the smarthome S6-1 spec).
+  (from the automation broker's custody spec).
 
 ### Fixed (at extraction)
 

@@ -67,11 +67,14 @@ _STORE_REGISTRY = None
 def _store_registry():
     global _STORE_REGISTRY
     if _STORE_REGISTRY is None:
-        import sys
 
-        sys.path.insert(
-            0, "HOME/GW"
-        )
+        from tests import _gw_path
+
+        if _gw_path.insert_groupware_path() is None:  # pragma: no cover
+            pytest.skip(
+                "groupware sibling checkout not available (set GROUPWARE_PATH)",
+                allow_module_level=False,
+            )
         from groupware_broker.policy import normalize_resource as gw_normalize
 
         from access_broker_core import policy as _cp
