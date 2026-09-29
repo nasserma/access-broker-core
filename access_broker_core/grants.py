@@ -60,6 +60,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from access_broker_core import policy as _policy
@@ -176,6 +177,13 @@ def _validate_item(item: Any, registry: PolicyRegistry) -> dict[str, Any]:
         "resource": resource,
         "ops": sorted(set(ops)),
         "expires_at": expires_iso,
+        # Display-only human label (e.g. Matrix room name); the policy
+        # wall never reads it and matching is by `resource` alone.
+        **(
+            {"label": item["label"]}
+            if isinstance(item.get("label"), str) and item["label"]
+            else {}
+        ),
     }
 
 
@@ -214,6 +222,13 @@ class GrantStore:
         # in production (single-process architecture), but the CAS guard and
         # SQLite's serialized mode keep transitions safe even if tooling
         # drives the store from another thread (tests exercise this).
+        db_parent = Path(db_path).resolve().parent
+        if not db_parent.is_dir():
+            raise ValueError(
+                f"grants_db parent directory does not exist: {db_parent} "
+                f"(create it before boot, or set storage.data_dir to an "
+                f"existing directory)"
+            )
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         # WAL: allows a reader (inspection tooling) while the server loop

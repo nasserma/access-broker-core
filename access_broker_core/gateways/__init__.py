@@ -171,6 +171,31 @@ def build_gateway(
         raise GatewayConfigError(f"gateway.{adapter_key}: section must be a mapping")
     fields = _resolve_fields(section)
 
+    # Shared-room routing (owner decision 2026-09-21, Option B): one
+    # approval room may serve several broker gateways; each declares its
+    # tag and requires prefixes on every typed command. The prefix is
+    # mandatory with shared_room and forbidden as a bare declaration
+    # without it (a prefix in a solo room is dead config that would
+    # surprise a future reader).
+    shared_room = fields.get("shared_room", False)
+    command_prefix = fields.pop("command_prefix", None)
+    fields.pop("shared_room", None)
+    if shared_room not in (True, False):
+        raise GatewayConfigError(
+            f"gateway.{adapter_key}: 'shared_room' must be a boolean"
+        )
+    if shared_room and (not isinstance(command_prefix, str) or not command_prefix.strip()):
+        raise GatewayConfigError(
+            f"gateway.{adapter_key}: shared_room=true requires a nonempty "
+            "'command_prefix' (the tag this gateway answers to, e.g. 'comms')"
+        )
+    if not shared_room and command_prefix is not None:
+        raise GatewayConfigError(
+            f"gateway.{adapter_key}: 'command_prefix' is only valid with "
+            "shared_room=true (a solo room needs no prefixes)"
+        )
+    command_prefix = command_prefix.strip() if command_prefix else None
+
     approver = _approver_of(section, adapter_key)
 
     core = ApprovalGatewayCore(
@@ -180,6 +205,8 @@ def build_gateway(
         now=clock,
         surface="",  # set by the builder below once the surface id is known
         audit=audit,
+        shared_room=bool(shared_room),
+        command_prefix=command_prefix,
     )
     adapter, surface = _ADAPTER_BUILDERS[adapter_key](core, fields, approver)
     core._surface = surface  # noqa: SLF001 - construction wiring

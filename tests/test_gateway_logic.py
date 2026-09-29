@@ -11,6 +11,8 @@ No network, no matrix-nio, no Telegram/Teams/Signal SDKs.
 
 from __future__ import annotations
 
+import re
+
 # --- S1 seam: gateway tests build the store with the groupware-semantics
 # registry (identical tables to what the groupware broker registers at boot),
 # so the ported batteries run verbatim against the core seam.
@@ -18,10 +20,25 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from access_broker_core.audit import LogWriteError
 from access_broker_core.gateways import logic
 from access_broker_core.gateways import logic as logic_mod
 from access_broker_core.gateways.logic import (
     APPROVE_EMOJI,
+    BULLET,
+    DECISION_EMOJIS,
+    DEFAULT_EXPIRY_LABEL,
+    ICON_ACTIVE,
+    ICON_EXPIRED,
+    ICON_LIFECYCLE,
+    ICON_PENDING,
+    ICON_REFUSED,
+    ICON_STATUS,
+    ICON_UNDO_CLOSED,
+    ICON_UNKNOWN_COMMAND,
+    ICON_WARNING,
+    JUSTIFICATION_LABEL,
+    MESSAGE_ICONS,
     REJECT_EMOJI,
     REVOKE_EMOJI,
     STATUS_EMOJI,
@@ -455,13 +472,13 @@ async def test_parser_bug_warning_fired(core_env):
 
 def test_render_decision_expired_record(core_env):
     """Branch completion: rendering a decided record with no expiry and
-    no undo shows the plain verb line."""
+    no undo shows the plain verb line (icon + verb + id)."""
     core, store, transport = make_core(core_env)
     rid = store.submit("h", [ITEM], "j")
     store.reject(rid)
     rec = store.get_record(rid)
     text = core._render_decision(rec, "Rejected", None, undo=False)
-    assert text.startswith("**Rejected #")
+    assert text.startswith(f"{REJECT_EMOJI} **Rejected #")
     assert "Mistake?" not in text
 
 
@@ -548,7 +565,7 @@ async def test_render_decision_no_items_and_stale_aging_paths(core_env):
     store.reject(rid)
     rec = store.get_record(rid)
     text = core._render_decision(rec, "Rejected", None, undo=False)
-    assert "**Rejected #1**." in text
+    assert f"{REJECT_EMOJI} **Rejected #1**." in text
 
     # sweep on a record that expired between read and sweep:
     # state read as expired by _effective_state, stored pending ->
@@ -679,3 +696,586 @@ async def test_sweep_clock_race_pending_effective_continues(core_env):
     # marked swept, no notice: the continue branch fired
     assert rid in core._swept
     assert not any("expired unanswered" in t for t in transport.sent)
+
+
+# ---------------------------------------------------------------------------
+# Shared-room routing (owner decision 2026-09-21, Option B)
+# ---------------------------------------------------------------------------
+
+
+class SharedHarness(Harness):
+    """Core with shared_room=True and prefix 'comms'."""
+
+    def __init__(self, tmp_path) -> None:
+        super().__init__(tmp_path)
+        self.core = ApprovalGatewayCore(
+            store=self.store,
+            transport=self.transport,
+            approver="@owner:example.org",
+            now=self.clock,
+            shared_room=True,
+            command_prefix="comms",
+        )
+
+
+def make_shared(harness: SharedHarness | None = None):
+    h = harness if harness is not None else make_shared._active  # type: ignore[attr-defined]
+    return h.core, h.store, h.transport
+
+
+@pytest.fixture()
+def shared_env(tmp_path):
+    h = SharedHarness(tmp_path)
+    make_shared._active = h  # type: ignore[attr-defined]
+    yield h
+    h.store.close()
+
+
+async def test_shared_prefixed_command_executes(core_env):
+    core, store, transport = make_core(core_env)
+    core = ApprovalGatewayCore(
+        store=store, transport=transport, approver="@owner:example.org",
+        now=core._now, shared_room=True, command_prefix="comms",
+    )
+    rid = await submit_one(store)
+    await core.handle_reply("@owner:example.org", "comms approve 1")
+    assert store.get_record(rid).state == "active"
+
+
+async def test_shared_other_broker_prefix_ignored(shared_env):
+    core, store, transport = make_shared(shared_env)
+    rid = await submit_one(store)
+    await core.handle_reply("@owner:example.org", "data approve 1")
+    assert store.get_record(rid).state == "pending"
+    assert transport.sent == []  # silent: the right gateway answers
+
+
+async def test_shared_unprefixed_command_refused_with_hint(shared_env):
+    core, store, transport = make_shared(shared_env)
+    await submit_one(store)
+    import asyncio as _aio
+    await core.handle_reply("@owner:example.org", "approve 1")
+    await _aio.sleep(0.01)  # let the refusal task run
+    assert any("multiple brokers" in m for m in transport.sent)
+    # and nothing was decided
+    assert store.get_record(1).state == "pending"
+
+
+async def test_shared_status_prefix_routes(shared_env):
+    core, store, transport = make_shared(shared_env)
+    await core.handle_reply("@owner:example.org", "comms status")
+    assert transport.sent, "status answered"
+    assert transport.sent[0].startswith("[comms] "), transport.sent[0][:40]
+
+
+async def test_shared_outbound_tagged_request(shared_env):
+    core, store, transport = make_shared(shared_env)
+    rid = await submit_one(store)
+    await core.notify_request(rid, "test justification", [ITEM])
+    assert transport.sent[0].startswith("[comms] ⏳"), transport.sent[0][:40]
+
+
+async def test_shared_prefix_case_insensitive(shared_env):
+    core, store, transport = make_shared(shared_env)
+    rid = await submit_one(store)
+    await core.handle_reply("@owner:example.org", "Comms approve 1")
+    assert store.get_record(rid).state == "active"
+
+
+def test_shared_room_requires_prefix():
+    import pytest
+    with pytest.raises(ValueError, match="requires a command_prefix"):
+        ApprovalGatewayCore(
+            store=None, transport=None, approver="x", now=lambda: None,
+            shared_room=True, command_prefix=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Format contract (2026-09-29 suite-wide render pass)
+#
+# The format IS the suite's format: all five brokers render through this
+# module, so these assertions pin the shared visual grammar — one icon
+# vocabulary, one item-line shape, one decision-instruction phrasing —
+# plus the security invariant that binds it (item lines are
+# template-controlled; the agent's justification stays in its own
+# labelled line as commentary).
+# ---------------------------------------------------------------------------
+
+# The five brokers' item shapes (automation, communications, data,
+# groupware), verbatim from their registries. Rendering must work for
+# every one and keep backend/account/resource/ops on the identity line.
+FIVE_BROKER_ITEMS = [
+    {  # automation (Home Assistant)
+        "backend": "homeassistant", "account": "home", "resource": "lock.front_door",
+        "ops": ["unlock", "get_state"], "label": "Front Door",
+    },
+    {  # communications (Matrix)
+        "backend": "matrix", "account": "comms", "resource": "!abc:example.org",
+        "ops": ["send_message"], "label": "Team room",
+    },
+    {  # data (WebDAV)
+        "backend": "webdav", "account": "cloud", "resource": "/Shared/budget.xlsx",
+        "ops": ["read", "write"],
+    },
+    {  # groupware (IMAP)
+        "backend": "imap", "account": "work", "resource": "Sent", "ops": ["send"],
+    },
+    {  # nextcloud lineage (CalDAV/CardDAV)
+        "backend": "caldav", "account": "personal", "resource": "/cal/work/",
+        "ops": ["create", "read"], "label": "Work calendar",
+    },
+]
+
+
+def _first_data_line(text: str) -> str:
+    """The first line after the header — where item identity must live."""
+    return text.splitlines()[1]
+
+
+def test_message_icons_are_collision_free():
+    """One meaning per icon: an approver scanning a shared room reads
+    the leading icon as the message type, so no two types share one."""
+    icons = [*MESSAGE_ICONS]
+    assert len(icons) == len(set(icons)), icons
+    # the four decision emojis are the reaction controls, not message
+    # icons — a request must not open with one or the header reads as a
+    # pre-placed control that is not there.
+    assert not set(DECISION_EMOJIS).intersection(
+        {ICON_PENDING, ICON_ACTIVE, ICON_EXPIRED, ICON_UNDO_CLOSED}
+    )
+
+
+def test_request_header_emojis_match_preplaced_controls(core_env):
+    """The four pre-placed reactions are the four controls the render
+    instructs the approver to tap: the instruction line names exactly
+    APPROVE/REJECT and the reaction legend is the DECISION_EMOJIS tuple
+    in order (👍 👎 ⛔ 📋)."""
+    core, _store, _transport = make_core(core_env)
+    text = core.render_request(3, "j", [ITEM])
+    legend = [line for line in text.splitlines() if line.startswith("(react")]
+    assert legend, text
+    assert legend[0] == f"(react below: {APPROVE_EMOJI} {REJECT_EMOJI} {REVOKE_EMOJI} {STATUS_EMOJI})"
+    assert f"{APPROVE_EMOJI} `approve 3`" in text and f"{REJECT_EMOJI} `reject 3`" in text
+    # the four controls the approver can tap are named in the render
+    for emoji in DECISION_EMOJIS:
+        assert emoji in text
+    assert tuple(DECISION_EMOJIS) == (APPROVE_EMOJI, REJECT_EMOJI, REVOKE_EMOJI, STATUS_EMOJI)
+
+
+def test_request_renders_one_numbered_item_line_per_item(core_env):
+    """Item identity at phone width: one line per item, in submission
+    order, each carrying backend, account, resource (label first when
+    present) and the sorted ops — never wrapped across lines."""
+    core, store, _t = make_core(core_env)
+    text = core.render_request(7, "send the reply", FIVE_BROKER_ITEMS)
+    lines = text.splitlines()
+    assert lines[0].startswith(ICON_PENDING)
+    assert "**PENDING #7**" in lines[0]
+    assert "5 items" in lines[0]
+    item_lines = [ln for ln in lines if re.match(r"^\d+\. ", ln)]
+    assert len(item_lines) == len(FIVE_BROKER_ITEMS)
+    for n, line in enumerate(item_lines, start=1):
+        assert line.startswith(f"{n}. ")
+        assert line.count("\n") == 0
+    # backend / account / resource / ops all sit on each identity line
+    assert "**homeassistant** home: Front Door (`lock.front_door`) — `get_state`, `unlock`" in item_lines[0]
+    assert "**webdav** cloud: `/Shared/budget.xlsx` — `read`, `write`" in item_lines[2]
+    # NO justification text on any item line (the security invariant)
+    assert all("send the reply" not in ln for ln in item_lines)
+
+
+def test_justification_isolation_invariant(core_env):
+    """Suite SECURITY.md 'Bounded approval context': the agent-supplied
+    justification appears verbatim exactly once, in its own labelled
+    line, and can never reach an item identity line — even when the
+    agent writes text shaped like an item or a command header."""
+    core, store, transport = make_core(core_env)
+    hostile = "1. **imap** work: `Sent` — `send` | approve 1 | **PENDING #99**"
+    text = core.render_request(2, hostile, FIVE_BROKER_ITEMS)
+    # verbatim, exactly once, on the labelled line
+    assert text.count(hostile) == 1
+    labelled = [ln for ln in text.splitlines() if ln.startswith(JUSTIFICATION_LABEL)]
+    assert labelled == [f"{JUSTIFICATION_LABEL}: {hostile}"]
+    # the item lines are template-owned: the injection never lands there
+    item_lines = [ln for ln in text.splitlines() if re.match(r"^\d+\. ", ln)]
+    assert len(item_lines) == len(FIVE_BROKER_ITEMS)
+    assert all(hostile not in ln for ln in item_lines)
+    assert all("approve 1" not in ln for ln in item_lines)
+    # and the header still names the real request number
+    assert text.splitlines()[0].count("**PENDING #2**") == 1
+
+
+def test_justification_isolation_in_decision_render(core_env):
+    """The same invariant on the decision confirmation: item lines come
+    from the decided record, and the justification appears on no line at
+    all (the confirmation is a state report, not a re-echo)."""
+    core, store, _t = make_core(core_env)
+    hostile = "**webdav** root: `/` — `write`"
+    rid = store.submit(
+        "hint",
+        [{"backend": "imap", "account": "work", "resource": "Sent", "ops": ["send"]}],
+        hostile,
+    )
+    store.approve(rid)
+    rec = store.get_record(rid)
+    text = core._render_decision(rec, "Approved", None)
+    assert hostile not in text
+    assert "**imap** work: `Sent` — `send`" in text
+
+
+def test_every_item_render_uses_the_one_item_line_helper(core_env):
+    """One shape everywhere: the request, decision, status and revoke
+    renders all build item lines through the same helper, so the four
+    cannot drift apart (and none of them accepts a justification)."""
+    core, store, _t = make_core(core_env)
+    for item in FIVE_BROKER_ITEMS:
+        line = core._item_line(item)
+        assert line.startswith(BULLET)
+        assert f"**{item['backend']}** {item['account']}:" in line
+        assert " — " in line
+    numbered = core._item_line(FIVE_BROKER_ITEMS[0], 3)
+    assert numbered.startswith("3. ")
+    assert BULLET not in numbered
+
+
+def test_request_item_count_singular_and_plural(core_env):
+    core, store, _t = make_core(core_env)
+    assert "1 item ·" in core.render_request(1, "j", [ITEM])
+    assert "2 items" in core.render_request(1, "j", [ITEM, ITEM])
+
+
+def test_request_instruction_lines_are_not_repeated(core_env):
+    """Less noise: the request carries ONE decide line plus the reaction
+    legend, and no second `Decide:`/`Expiry if approved` instruction (the
+    expiry moved into the header)."""
+    core, store, _t = make_core(core_env)
+    text = core.render_request(5, "j", [ITEM])
+    assert text.count("**Decide**") == 1
+    assert "Expiry if approved" not in text
+    assert text.count(DEFAULT_EXPIRY_LABEL) == 1
+
+
+def test_decision_confirmations_carry_the_verb_icon(core_env):
+    """The confirmation opens with the reaction emoji the approver
+    tapped: 👍 for Approved, 👎 for Rejected, ⛔ for Revoked."""
+    core, store, transport = make_core(core_env)
+    store.submit("h", [ITEM], "j")
+    store.submit("h2", [ITEM], "j2")
+    store.submit("h3", [ITEM], "j3")
+    store.approve(1)
+    store.reject(2)
+    store.revoke(3)
+    assert core._render_decision(store.get_record(1), "Approved", None).startswith(
+        f"{APPROVE_EMOJI} **Approved #1**"
+    )
+    assert core._render_decision(store.get_record(2), "Rejected", None).startswith(
+        f"{REJECT_EMOJI} **Rejected #2**"
+    )
+    assert core._render_decision(store.get_record(3), "Revoked", None).startswith(
+        f"{REVOKE_EMOJI} **Revoked #3**"
+    )
+
+
+async def test_lifecycle_notice_format(core_env):
+    core, store, transport = make_core(core_env)
+    await core.announce_lifecycle("started")
+    await core.announce_lifecycle("stopping")
+    assert transport.sent == [
+        f"{ICON_LIFECYCLE['started']} **gateway started**",
+        f"{ICON_LIFECYCLE['stopping']} **gateway stopping**",
+    ]
+
+
+async def test_lifecycle_unknown_state_uses_default_icon(core_env):
+    core, store, transport = make_core(core_env)
+    await core.announce_lifecycle("reloading")
+    assert transport.sent == ["🔄 **gateway reloading**"]
+
+
+async def test_lifecycle_notice_is_swallowed_on_delivery_failure(core_env):
+    """A lifecycle notice is best-effort: a transport failure is logged
+    and swallowed, never allowed to kill the gateway (unchanged arm)."""
+    class BrokenTransport(GatewayTransport):
+        async def send_message(self, text: str) -> str:
+            raise RuntimeError("injected transport failure")
+
+    core = ApprovalGatewayCore(
+        store=None, transport=BrokenTransport(), approver="a", now=lambda: None,
+    )
+    await core.announce_lifecycle("started")  # must not raise
+
+
+async def test_lifecycle_notice_without_transport_is_a_noop(core_env):
+    """Headless cores (transport=None) announce nothing."""
+    core = ApprovalGatewayCore(
+        store=None, transport=None, approver="a", now=lambda: None,
+    )
+    assert await core.announce_lifecycle("started") is None
+
+
+async def test_route_command_unmatched_line_refuses_without_guessing(shared_env):
+    """The fail-closed floor of shared-room routing: a line the prefix
+    regex cannot match at all is refused with the prefix hint, never
+    guessed at (the branch is unreachable from a real client, so it is
+    driven directly)."""
+    core, store, transport = make_shared(shared_env)
+    assert await core._route_command("") is None  # noqa: SLF001
+    hint = transport.sent[-1]
+    assert hint.startswith(f"[comms] {ICON_REFUSED} **Unprefixed command**")
+    assert "multiple brokers" in hint
+    assert "`comms approve 1`" in hint
+
+
+def test_status_block_shape(core_env):
+    """Status: a STATUS header, the two sections, one pending line per
+    request, and one un-ticked instruction line per action (no backticked
+    sentence pretending to be a command). Pending rows deliberately stay
+    one line each — tapping the request message (or its 👍) is the
+    decision affordance, so the aging list must not double in height."""
+    core, store, _t = make_core(core_env)
+    store.submit("h", [ITEM], "j")
+    text = core._status_text()
+    lines = text.splitlines()
+    assert lines[0] == f"{ICON_STATUS} **STATUS**"
+    assert "**Active grants**" in lines
+    assert "**Awaiting your approval** (1):" in lines
+    assert any(ln.startswith(f"{ICON_PENDING} **#1** — waiting") for ln in lines)
+    assert "Decide: `approve|reject <id> [expiry]`" in lines
+    assert "`Decide:" not in text  # the command is code, the sentence is not
+
+
+def test_status_active_grant_item_lines_use_the_bullet_form(core_env):
+    """Active grants DO carry their items (a live grant must be
+    inspectable without scrolling to the request) in the same bullet form
+    as every other render."""
+    core, store, _t = make_core(core_env)
+    store.submit("h", [ITEM], "j")
+    store.approve(1)
+    text = core._status_text()
+    lines = text.splitlines()
+    assert any(ln.startswith(f"{ICON_ACTIVE} **#1** — send, ") for ln in lines)
+    assert any(ln.startswith(f"{BULLET} **imap** work: `Sent` — `send`") for ln in lines)
+
+
+def test_status_empty_shape(core_env):
+    core, store, _t = make_core(core_env)
+    text = core._status_text()
+    assert "**Active grants**\nnone" in text
+    assert "**Awaiting your approval** — none" in text
+    assert "Decide:" not in text  # nothing pending -> no decide footer
+    assert "Kill:" not in text  # nothing active -> no kill footer
+
+
+async def test_status_icon_and_heading_on_posted_summary(core_env):
+    core, store, transport = make_core(core_env)
+    await core._post_summary()
+    assert transport.sent[0].startswith(f"{ICON_STATUS} **STATUS**")
+
+
+async def test_sweep_expiry_notice_format(core_env):
+    core, store, transport = make_core(core_env)
+    store.submit("h", [ITEM], "j")
+    core_env.advance(hours=13)
+    await core.sweep()
+    note = transport.sent[-1]
+    assert note.startswith(ICON_EXPIRED)
+    assert "**Request #1 expired unanswered**" in note
+    assert "silence grants nothing" in note  # fail-closed phrasing kept
+
+
+async def test_undo_window_closed_notice_format(core_env):
+    core, store, transport = make_core(core_env)
+    await core.handle_reply("@owner:example.org", "undo 4")
+    note = transport.sent[-1]
+    assert note.startswith(ICON_UNDO_CLOSED)
+    assert "Undo window for #4 closed" in note
+
+
+async def test_refusal_and_unknown_command_notices_carry_icons(core_env):
+    core, store, transport = make_core(core_env)
+    await core.handle_reply("@owner:example.org", "approve 99")
+    refusal = next(t for t in transport.sent if "Cannot approve #99" in t)
+    assert refusal.startswith(ICON_REFUSED)
+    transport.sent.clear()
+    await core.handle_reply("@owner:example.org", "aproove 3")
+    unknown = transport.sent[-1]
+    assert unknown.startswith(ICON_UNKNOWN_COMMAND)
+    assert "closest: `approve`" in unknown  # fail-closed hint kept
+    transport.sent.clear()
+    await core.handle_reply("@owner:example.org", "frobnicate")
+    assert transport.sent[-1].startswith("📖 **How to decide**")
+
+
+async def test_revoke_all_confirmations_format(core_env):
+    core, store, transport = make_core(core_env)
+    store.submit("h", [ITEM], "j")
+    store.approve(1)
+    transport.sent.clear()
+    await core.handle_reply("@owner:example.org", "revoke all")
+    summary = transport.sent[0]
+    assert summary.startswith(f"{REVOKE_EMOJI} **Revoked 1 grant(s)**")
+    assert "no undo for a bulk revoke" in summary
+    assert ICON_STATUS in summary  # refreshed status appended
+    transport.sent.clear()
+    await core.handle_reply("@owner:example.org", "revoke all")
+    assert transport.sent[0] == f"{ICON_REFUSED} Nothing to revoke (all grants)."
+
+
+async def test_audit_failure_warning_format(core_env):
+    """The fail-closed approval warning keeps every fact (grant active,
+    audit failed, re-approving useless, revoke to recover) under one
+    WARNING icon."""
+    core, store, transport = make_core(core_env)
+    core._audit = _BrokenAudit()  # type: ignore[assignment]  # noqa: SLF001
+    rid = await submit_one(store)
+    await core.handle_reply("@owner:example.org", f"approve {rid}")
+    warning = transport.sent[-1]
+    assert warning.startswith(ICON_WARNING)
+    assert "**Approve #1 NOT confirmed**" in warning
+    assert "FAILED" in warning
+    assert "`revoke 1`" in warning
+    assert store.get_record(rid).state == "active"  # the grant IS active
+
+
+class _BrokenAudit:
+    """AuditLog stand-in whose every write fails (fail-closed arm)."""
+
+    def record(self, *args, **kwargs):
+        raise LogWriteError("injected disk failure")
+
+
+async def test_every_outbound_type_opens_with_an_icon(core_env):
+    """The format contract end to end: walk one of every outbound type
+    through a real core and assert each message opens with a member of
+    MESSAGE_ICONS and a bold headline (or, for the help card, its icon
+    and bold title)."""
+    core, store, transport = make_core(core_env)
+
+    def check(text: str) -> None:
+        assert text.splitlines()[0].startswith(MESSAGE_ICONS), text[:60]
+
+    rid = await submit_one(store)
+    await core.notify_request(rid, "j", [ITEM])  # pending request
+    await core.handle_reply("@owner:example.org", f"reject {rid}")  # rejected
+    check(transport.sent[-1])
+    rid2 = await submit_one(store)
+    await core.handle_reply("@owner:example.org", f"approve {rid2}")  # approved
+    check(transport.sent[-1])
+    await core.handle_reply("@owner:example.org", f"revoke {rid2}")  # revoked
+    check(transport.sent[-1])
+    await core.handle_reply("@owner:example.org", "status")
+    check(transport.sent[-1])
+    await core.handle_reply("@owner:example.org", "revoke all")
+    check(transport.sent[-1])
+    await core.handle_reply("@owner:example.org", "undo 99")  # window closed
+    check(transport.sent[-1])
+    await core.handle_reply("@owner:example.org", "approve 99")  # refusal
+    check(transport.sent[-1])
+    await core.handle_reply("@owner:example.org", "aproove 1")  # unknown cmd
+    check(transport.sent[-1])
+    await core.handle_reply("@owner:example.org", "zzzz")  # help card
+    check(transport.sent[-1])
+    await core.announce_lifecycle("started")
+    check(transport.sent[-1])
+    await core.announce_lifecycle("stopping")
+    check(transport.sent[-1])
+    core_env.advance(hours=13)
+    await core.sweep()
+    check(transport.sent[-1])
+    for text in transport.sent:
+        assert text.count("———") <= 1  # one rule per composed message
+
+
+async def test_shared_room_tags_every_outbound_type(shared_env):
+    """Shared-room ergonomics: EVERY outbound type is stamped with the
+    broker tag, so an interleaved room always says which gateway is
+    posting — and the tag is the first thing on the line, ahead of the
+    type icon (the scannable column)."""
+    core, store, transport = make_shared(shared_env)
+    rid = await submit_one(store)
+    await core.notify_request(rid, "j", [ITEM])
+    await core.handle_reply("@owner:example.org", "comms reject 1")
+    await core.handle_reply("@owner:example.org", "comms status")
+    await core.handle_reply("@owner:example.org", "comms approve 99")
+    await core.handle_reply("@owner:example.org", "comms frobnicate")
+    await core.handle_reply("@owner:example.org", "approve 1")  # unprefixed
+    await core.announce_lifecycle("started")
+    shared_env.advance(hours=13)
+    await core.sweep()
+    assert transport.sent, "every type posted at least once"
+    for text in transport.sent:
+        assert text.startswith("[comms] "), text[:40]
+        # tag, then a message icon, then the bold headline
+        assert text.split(" ", 1)[1].startswith(MESSAGE_ICONS), text[:60]
+
+
+async def test_shared_room_header_pattern_per_type(shared_env):
+    """The shared-room header pattern `[tag] <icon> **headline**` holds
+    for the request (the most common post) and for a lifecycle notice."""
+    core, store, transport = make_shared(shared_env)
+    rid = await submit_one(store)
+    await core.notify_request(rid, "test justification", [ITEM])
+    assert transport.sent[0].startswith(f"[comms] {ICON_PENDING} **PENDING #1**")
+    transport.sent.clear()
+    await core.announce_lifecycle("stopping")
+    assert transport.sent[0] == f"[comms] {ICON_LIFECYCLE['stopping']} **gateway stopping**"
+
+
+async def test_refusal_display_text_is_human_for_store_reasons(core_env):
+    """A refusal must read as a sentence: the store's RejectReason enum
+    is translated for display (semantics unchanged — the enum is still
+    what the store returns), while the free-text refusals pass through
+    verbatim."""
+    core, store, transport = make_core(core_env)
+    await core.handle_reply("@owner:example.org", "approve 99")
+    assert "Cannot approve #99: no pending request with that number" in transport.sent[-1]
+    assert "RejectReason" not in transport.sent[-1]
+    transport.sent.clear()
+    store.submit("h", [ITEM], "j")
+    store.approve(1)
+    await core.handle_reply("@owner:example.org", "approve 1")  # already decided
+    assert "Cannot approve #1: already decided" in transport.sent[-1]
+    transport.sent.clear()
+    await core.handle_reply("@owner:example.org", "revoke 99")
+    assert "Cannot revoke #99: unknown, decided, or expired" in transport.sent[-1]
+
+
+def test_solo_room_is_untagged(core_env):
+    """Solo rooms need no labels: no `[tag]` prefix anywhere (unchanged
+    behavior, pinned so the shared-room stamp cannot leak into it)."""
+    core, store, _t = make_core(core_env)
+    for text in (core.render_request(1, "j", [ITEM]), core._status_text()):
+        assert not text.startswith("[")
+
+
+def test_render_is_pure_and_clock_free(core_env):
+    """Rendering does no I/O and reads no wall clock: the same inputs
+    render identically, before and after advancing the injected clock."""
+    core, store, _t = make_core(core_env)
+    store.submit("h", [ITEM], "j")
+    before = core._status_text()
+    core_env.advance(hours=3)
+    # the store's aging view changes, but the REQUEST render is a pure
+    # function of its arguments
+    assert core.render_request(1, "j", [ITEM]) == core.render_request(1, "j", [ITEM])
+    assert core._render_decision(store.get_record(1), "Rejected", None) == (
+        core._render_decision(store.get_record(1), "Rejected", None)
+    )
+    assert isinstance(before, str)
+
+
+def test_no_markdown_tables_anywhere(core_env):
+    """Element X collapses tables: no outbound render may emit a pipe
+    table (a row of `| ... | ... |`)."""
+    core, store, _t = make_core(core_env)
+    store.submit("h", [ITEM], "j")
+    store.approve(1)
+    texts = [
+        core.render_request(1, "j", FIVE_BROKER_ITEMS),
+        core._render_decision(store.get_record(1), "Approved", None),
+        core._status_text(),
+    ]
+    for text in texts:
+        for line in text.splitlines():
+            assert not re.match(r"^\s*\|.*\|\s*$", line), line

@@ -34,6 +34,27 @@ Vocabulary rework for the PIM domain (per S5 design note rev 2):
 Canonical emoji set (one grammar across all four gateways; transports
 without native reactions still post the four controls as text lines):
 approve 👍, reject 👎, revoke ⛔, status 📋.
+
+Message format contract (2026-09-29 suite-wide render pass; the format
+IS the suite's format because all five brokers render through this
+module):
+
+- Every outbound type is ``[tag] <icon> **<headline>** — <tail>`` when
+  the room is shared (the ``[tag]`` is stamped by ``_tag``), so a room
+  carrying several brokers stays scannable while posts interleave.
+- One verb, one icon; the decision confirmations reuse the reaction
+  emojis the approver tapped (``_VERB_ICONS`` is built from
+  ``DECISION_EMOJIS``), so the render and the pre-placed controls share
+  one vocabulary.
+- Item lines are ONE line per item: an index or bullet, the bold
+  backend, the account, the resource in inline code and the sorted ops.
+  They are ALWAYS template-controlled: the agent-supplied
+  justification appears verbatim in exactly ONE labelled line
+  ("Justification (agent, unverified):") and never reaches the item
+  identity lines or the pre-placed reactions (suite SECURITY.md,
+  "Bounded approval context").
+- Matrix-safe markdown only: bold, inline code, bullets and em dashes.
+  No tables (Element X collapses them), no nested emphasis.
 """
 
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -66,10 +87,67 @@ Deliberately short; restarts close all windows (fail closed)."""
 
 DEFAULT_EXPIRY_LABEL = "24h"
 
-_HELP_TEXT = """**How to decide**
+# Decision verbs -> the reaction emoji that produced them. Built from
+# DECISION_EMOJIS so the confirmation header always shows the control
+# the approver tapped (test-pinned: the render and the pre-placed
+# controls cannot drift apart).
+_VERB_ICONS = {
+    "Approved": APPROVE_EMOJI,
+    "Rejected": REJECT_EMOJI,
+    "Revoked": REVOKE_EMOJI,
+}
+
+# Non-decision notice icons (one meaning per icon, no reuse across
+# meanings; every one is a plain pictograph Element X renders).
+ICON_PENDING = "⏳"
+ICON_ACTIVE = "✅"
+ICON_STATUS = STATUS_EMOJI
+ICON_EXPIRED = "⏱️"
+ICON_UNDO_CLOSED = "⌛"
+ICON_REFUSED = "❌"
+ICON_WARNING = "⚠️"
+ICON_UNKNOWN_COMMAND = "❓"
+ICON_HELP = "📖"
+ICON_LIFECYCLE = {"started": "🟢", "stopping": "⚪"}
+ICON_LIFECYCLE_DEFAULT = "🔄"
+
+# Every outbound message OPENS with one of these icons (format contract);
+# the set is kept collision-free so an icon always means one thing.
+MESSAGE_ICONS = (
+    ICON_PENDING,
+    ICON_ACTIVE,
+    ICON_STATUS,
+    ICON_EXPIRED,
+    ICON_UNDO_CLOSED,
+    ICON_REFUSED,
+    ICON_WARNING,
+    ICON_UNKNOWN_COMMAND,
+    ICON_HELP,
+    *ICON_LIFECYCLE.values(),
+    *_VERB_ICONS.values(),
+)
+
+# Item-line bullet for the non-request renders (one list style suite-wide).
+BULLET = "•"
+
+# The one labelled line the agent-supplied free text may occupy.
+JUSTIFICATION_LABEL = "Justification (agent, unverified)"
+
+_RULE = "———"
+
+# Human text for the two store refusal reasons (display only: the store
+# still returns the enum and the refusal semantics are unchanged). The
+# approver should never read Python syntax in a decision reply.
+_REJECT_REASON_TEXT = {
+    RejectReason.UNKNOWN_REQUEST: "no pending request with that number"
+    " (expired, already decided, or never issued)",
+    RejectReason.ALREADY_DECIDED: "already decided",
+}
+
+_HELP_TEXT = f"""{ICON_HELP} **How to decide**
 
 **Reactions** — tap on a request message:
-👍 approve · 👎 reject · ⛔ revoke · 📋 status
+{APPROVE_EMOJI} approve · {REJECT_EMOJI} reject · {REVOKE_EMOJI} revoke · {STATUS_EMOJI} status
 
 **Commands** — type here:
 `approve <id> [expiry]` — e.g. `approve 3`, `approve 3 8h`
@@ -84,12 +162,25 @@ _REPLY_RE = re.compile(
     r"(?:\s+(\d{1,3}[hmd]))?$",
     re.IGNORECASE,
 )
-_REVOKE_TARGET_RE = re.compile(
+_REPLY_TARGET_RE = re.compile(
     r"^revoke\s+(all)$",
     re.IGNORECASE,
 )
 
 _COMMANDS = ("approve", "reject", "revoke", "undo", "status")
+
+# Shared-room routing (2026-09-21, owner decision Option B): when one
+# approval room serves several broker gateways, every typed command is
+# seen by every gateway's sync loop. Each gateway therefore claims only
+# commands prefixed with its own tag ("comms approve 1"); unprefixed
+# commands are refused with a hint (fail-closed: never guessed at), and
+# other brokers' prefixed commands are ignored SILENTLY (the right
+# gateway answers; a refusal from the wrong one is noise). The prefix is
+# also stamped on every outbound message so the human can tell which
+# broker is speaking when several share one @identity.
+_COMMAND_PREFIX_RE = re.compile(
+    r"^([a-z][a-z0-9_-]{0,31})\s+(.+)$", re.DOTALL | re.IGNORECASE
+)
 
 _DURATION_RE = re.compile(r"^(\d{1,3})([hmd])$", re.IGNORECASE)
 _DURATION_UNITS = {"h": "hours", "m": "minutes", "d": "days"}
@@ -121,7 +212,7 @@ def parse_reply(text: str) -> tuple[str, int | None, timedelta | None] | None:  
     text = text.strip()
     m = _REPLY_RE.match(text)
     if not m:
-        if _REVOKE_TARGET_RE.match(text):
+        if _REPLY_TARGET_RE.match(text):
             return ("revoke_all", None, None)
         return None
     action = m.group(1).lower()
@@ -198,6 +289,12 @@ class ApprovalGatewayCore:
 
     The core holds NO authorization power: it can only call store
     transitions, which refuse decided/unknown numbers.
+
+    Shared-room routing: when ``shared_room=True`` and a ``command_prefix``
+    is set, typed commands must carry the prefix ("comms approve 1"),
+    unprefixed commands are refused with a hint, and every outbound
+    message is tagged "[comms] ..." so the human can tell brokers apart
+    in a room where several gateways post under one identity.
     """
 
     def __init__(
@@ -208,6 +305,8 @@ class ApprovalGatewayCore:
         now: Callable[[], datetime],
         surface: str = "approvals",
         audit: AuditLog | None = None,
+        shared_room: bool = False,
+        command_prefix: str | None = None,
     ) -> None:
         """store: the GrantStore all decisions route through.
         transport: the gateway's I/O shell. approver: the single
@@ -232,6 +331,13 @@ class ApprovalGatewayCore:
         self._event_to_request: dict[str, int] = {}
         self._swept: set[int] = set()
         self._undo_windows: dict[int, tuple[datetime, dict]] = {}
+        if shared_room and not command_prefix:
+            raise ValueError(
+                "gateway shared_room=True requires a command_prefix "
+                "(the tag this gateway answers to and stamps on outbound messages)"
+            )
+        self._shared_room = bool(shared_room)
+        self._prefix = command_prefix if command_prefix else ""
 
     # ------------------------------------------------------------ audit
 
@@ -269,24 +375,64 @@ class ApprovalGatewayCore:
 
     # ------------------------------------------------------------- posting
 
-    def render_request(self, number: int, justification: str, items: list[dict]) -> str:
-        """Markdown for a pending request: header names the id, each item
-        is ONE line (backend/account/resource + ops) so item identity
-        survives phone-width wrapping."""
-        lines = [
-            f"⏳ **PENDING #{number}** — awaiting your approval",
-            f"Justification: {justification}",
-        ]
-        for i, item in enumerate(items, start=1):
-            ops = ", ".join(sorted(item.get("ops", [])))
-            lines.append(
-                f"{i}. **{item['backend']}** {item['account']}:"
-                f"`{item['resource']}` — {ops}"
-            )
-        lines.append(
-            "Expiry if approved: 24h (or `approve <id> 8h` for shorter)"
+    @staticmethod
+    def _item_resource_display(item: dict) -> str:
+        """Display form of one grant item's resource: the human label
+        when present (e.g. Matrix room name), else the raw resource.
+        Matching never uses this — item['resource'] stays the wall key."""
+        label = item.get("label")
+        if isinstance(label, str) and label and label != item["resource"]:
+            return f"{label} (`{item['resource']}`)"
+        return f"`{item['resource']}`"
+
+    def _item_line(self, item: dict, index: int | None = None) -> str:
+        """ONE template-controlled item identity line.
+
+        Only store-validated item fields reach this line: backend,
+        account, resource (plus the display-only ``label``) and the
+        sorted operation set. The agent-supplied justification is NOT
+        an input here and can never appear on an item line or on a
+        pre-placed reaction — the suite's "Bounded approval context"
+        invariant. ``index`` numbers request items (1., 2., ...); the
+        other renders bullet them.
+        """
+        ops = ", ".join(f"`{op}`" for op in sorted(item.get("ops", [])))
+        marker = f"{index}." if index is not None else BULLET
+        return (
+            f"{marker} **{item['backend']}** {item['account']}:"
+            f" {self._item_resource_display(item)} — {ops}"
         )
-        lines.append("Decide: `approve|reject <id> [expiry]`")
+
+    @staticmethod
+    def _compose(*parts: str) -> str:
+        """Join a decision body and the refreshed status with the suite
+        rule — one separator everywhere, no table (Element X collapses
+        tables)."""
+        return f"\n\n{_RULE}\n\n".join(parts)
+
+    def render_request(self, number: int, justification: str, items: list[dict]) -> str:
+        """Markdown for a pending request: the header names the id, the
+        item count and the default expiry (the three things the
+        approver decides between), each item is ONE template-controlled
+        line (backend/account/resource + ops) so item identity survives
+        phone-width wrapping, and the agent-supplied justification sits
+        in its own labelled line as commentary — never as the approval
+        target."""
+        count = len(items)
+        lines = [
+            f"{ICON_PENDING} **PENDING #{number}** — awaiting your approval"
+            f" · {count} item{'s' if count != 1 else ''} ·"
+            f" {DEFAULT_EXPIRY_LABEL} if approved",
+        ]
+        lines += [self._item_line(item, i) for i, item in enumerate(items, start=1)]
+        lines += [
+            f"{JUSTIFICATION_LABEL}: {justification}",
+            "",
+            f"**Decide** — {APPROVE_EMOJI} `approve {number}`, or"
+            f" {REJECT_EMOJI} `reject {number}`"
+            f" · shorter: `approve {number} 8h`",
+            f"(react below: {APPROVE_EMOJI} {REJECT_EMOJI} {REVOKE_EMOJI} {STATUS_EMOJI})",
+        ]
         return "\n".join(lines)
 
     async def post_request(self, number: int, justification: str, items: list[dict]) -> str:
@@ -295,7 +441,7 @@ class ApprovalGatewayCore:
         posted event id. The event→request mapping is in-memory only —
         sound because the store rejects all pending requests at restart,
         so post-restart reactions resolve to nothing."""
-        event_id = await self._transport.send_message(
+        event_id = await self._post(
             self.render_request(number, justification, items)
         )
         for emoji in DECISION_EMOJIS:
@@ -353,20 +499,26 @@ class ApprovalGatewayCore:
 
     async def handle_reply(self, sender: str, text: str) -> None:
         """Route a typed command ('approve 47 8h', 'reject 47', 'revoke
-        47', 'revoke all', 'undo 47', 'status') — allowlist first."""
+        47', 'revoke all', 'undo 47', 'status') — allowlist first, then
+        shared-room prefix routing."""
         if sender != self._approver:
             return
+        if self._shared_room:
+            routed = await self._route_command(text)
+            if routed is None:
+                return  # another broker's command; the right gateway answers
+            text = routed
         parsed = parse_reply(text)
         if parsed is None:
             first_word = text.strip().split(" ", 1)[0] if text.strip() else ""
             closest = closest_command(first_word)
             if closest:
-                await self._transport.send_message(
-                    f"Unknown command '{first_word}' — closest: `{closest}`. "
-                    "Type `status` to see the command list."
+                await self._post(
+                    f"{ICON_UNKNOWN_COMMAND} **Unknown command** `{first_word}`"
+                    f" — closest: `{closest}`. `status` lists every command."
                 )
             else:
-                await self._transport.send_message(_HELP_TEXT)
+                await self._post(_HELP_TEXT)
             return
         action, rid, duration = parsed
         if action == "status":
@@ -384,6 +536,68 @@ class ApprovalGatewayCore:
         else:  # parse_reply only yields plain revoke here
             await self._revoke(rid, sender)
 
+    # --------------------------------------------------- shared-room routing
+
+    async def _post(self, text: str) -> str:
+        """The ONE outbound choke point: stamps the broker tag in
+        shared-room mode, then posts through the transport."""
+        return await self._transport.send_message(self._tag(text))
+
+    async def announce_lifecycle(self, state: str) -> None:
+        """Post a gateway startup/shutdown notice to the room (owner
+        directive 2026-09-21: the approval room itself must show which
+        brokers are alive). Adapters call this after a successful
+        start() and at the top of stop(); a delivery failure is logged
+        and swallowed — a lifecycle notice must never kill the gateway.
+        """
+        if not self._transport:
+            return
+        icon = ICON_LIFECYCLE.get(state, ICON_LIFECYCLE_DEFAULT)
+        try:
+            await self._post(f"{icon} **gateway {state}**")
+        except Exception:  # noqa: BLE001 - notice is best-effort
+            logger.exception("gateway lifecycle notice failed")
+
+    def _tag(self, text: str) -> str:
+        """Stamp the broker tag on an outbound message (shared-room
+        mode only; solo rooms need no labels)."""
+        if self._shared_room:
+            return f"[{self._prefix}] {text}"
+        return text
+
+    async def _route_command(self, text: str) -> str | None:
+        """Resolve one inbound line in shared-room mode.
+
+        Returns the command body to parse (prefix stripped), or None
+        when this gateway must stay silent. Unprefixed commands are
+        refused with a hint (fail-closed: never guessed at); other
+        brokers' prefixed commands are ignored silently (the right
+        gateway answers; a refusal from the wrong one is noise).
+        """
+        stripped = text.strip()
+        m = _COMMAND_PREFIX_RE.match(stripped)
+        if not m:
+            # Unreachable in practice: the prefix regex matches any
+            # "word rest" line, and the commands are single words.
+            await self._post(
+                f"{ICON_REFUSED} **Unprefixed command** — this room serves multiple"
+                f" brokers. Prefix with `{self._prefix} approve 1`,"
+                f" `{self._prefix} status`, ..."
+            )
+            return None
+        tag, body = m.group(1).lower(), m.group(2).strip()
+        if tag in _COMMANDS or _REPLY_TARGET_RE.match(stripped):
+            # The line LOOKS like a bare command (first word is a known
+            # command): refuse it as unprefixed, never silently drop.
+            await self._post(
+                f"{ICON_REFUSED} **Unprefixed command** — this room serves multiple"
+                f" brokers. Prefix with `{self._prefix} {stripped.split(' ', 1)[0]}`..."
+            )
+            return None
+        if tag != self._prefix:
+            return None  # another broker's command
+        return body
+
     # ------------------------------------------------------------------ undo
 
     async def _undo(self, rid: int, sender: str) -> None:
@@ -394,8 +608,8 @@ class ApprovalGatewayCore:
         window = self._undo_windows.get(rid)
         if window is None or self._now() >= window[0]:
             self._undo_windows.pop(rid, None)
-            await self._transport.send_message(
-                f"Undo window for #{rid} closed. "
+            await self._post(
+                f"{ICON_UNDO_CLOSED} Undo window for #{rid} closed. "
                 "File a new request if access is still needed."
             )
             return
@@ -464,11 +678,12 @@ class ApprovalGatewayCore:
                     exc,
                     rid,
                 )
-                await self._transport.send_message(
-                    f"⚠️ Approve #{rid} reached the grant store but its audit "
-                    "entry FAILED — grant NOT confirmed (the grant IS active; "
-                    f"re-approving will not work). Resolve the audit log, then "
-                    f"revoke with `revoke {rid}` if this was not intended."
+                await self._post(
+                    f"{ICON_WARNING} **Approve #{rid} NOT confirmed** — the grant"
+                    " store committed the grant, but its audit entry FAILED."
+                    " Resolve the audit log, then `revoke"
+                    f" {rid}` if this was not intended. (Re-approving will not"
+                    " work.)"
                 )
                 return
             logger.info(
@@ -481,9 +696,9 @@ class ApprovalGatewayCore:
             self._event_to_request = {
                 e: n for e, n in self._event_to_request.items() if n != rid
             }
-            await self._transport.send_message(
-                self._render_decision(result, "Approved", duration) + "\n\n——\n\n"
-                + self._status_text()
+            await self._post(
+                self._compose(self._render_decision(result, "Approved", duration),
+                              self._status_text())
             )
         else:
             if not self._store.reject(rid):
@@ -505,10 +720,9 @@ class ApprovalGatewayCore:
             self._event_to_request = {
                 e: n for e, n in self._event_to_request.items() if n != rid
             }
-            await self._transport.send_message(
-                self._render_decision(record, "Rejected", None, undo=True)
-                + "\n\n——\n\n"
-                + self._status_text()
+            await self._post(
+                self._compose(self._render_decision(record, "Rejected", None, undo=True),
+                              self._status_text())
             )
 
     async def _refused(
@@ -521,7 +735,12 @@ class ApprovalGatewayCore:
             sender,
             reason,
         )
-        await self._transport.send_message(f"Cannot {action} #{rid}: {reason}")
+        display = (
+            _REJECT_REASON_TEXT[reason]
+            if isinstance(reason, RejectReason)
+            else reason
+        )
+        await self._post(f"{ICON_REFUSED} Cannot {action} #{rid}: {display}")
 
     async def _revoke(self, rid: int, sender: str) -> None:
         """Operator kill switch on one number (works on pending AND
@@ -539,10 +758,9 @@ class ApprovalGatewayCore:
         logger.info("decision: rid=%d action=revoke outcome=revoked sender=%s", rid, sender)
         record = self._store.get_record(rid)
         self._arm_undo(rid, record)
-        await self._transport.send_message(
-            self._render_decision(record, "Revoked", None, undo=True)
-            + "\n\n——\n\n"
-            + self._status_text()
+        await self._post(
+            self._compose(self._render_decision(record, "Revoked", None, undo=True),
+                          self._status_text())
         )
 
     async def _revoke_many(self, sender: str) -> None:
@@ -563,10 +781,14 @@ class ApprovalGatewayCore:
             except LogWriteError as exc:
                 logger.error("AUDIT: revoke_all decision entry failed: %s", exc)
         if not count:
-            await self._transport.send_message("Nothing to revoke (all grants).")
+            await self._post(f"{ICON_REFUSED} Nothing to revoke (all grants).")
             return
-        await self._transport.send_message(
-            f"**Revoked {count} grant(s)**.\n\n——\n\n" + self._status_text()
+        await self._post(
+            self._compose(
+                f"{REVOKE_EMOJI} **Revoked {count} grant(s)** — no undo for a"
+                " bulk revoke.",
+                self._status_text(),
+            )
         )
 
     # ------------------------------------------------------------ rendering
@@ -574,20 +796,19 @@ class ApprovalGatewayCore:
     def _render_decision(
         self, record, verb: str, duration: timedelta | None, undo: bool = False
     ) -> str:
-        head = f"**{verb} #{record.request_number}**"
+        """One decision confirmation: verb icon + id + resulting expiry
+        (ACTIVE only), the affected items as template-controlled bullet
+        lines, and — for the reversible verbs (reject/revoke) — the undo
+        window as the last line. The items come from the decided record
+        (the store's authority), never from the request text."""
+        head = f"{_VERB_ICONS[verb]} **{verb} #{record.request_number}**"
         if record.state == "active":
-            expiry = (
-                format_remaining(duration) + "." if duration else "24h."
-            )
+            expiry = format_remaining(duration) + "." if duration else "24h."
             head += f" ({expiry})"
         else:
             head += "."
         if record.items:
-            item_lines = [
-                f"  **{i['backend']}** {i['account']}:`{i['resource']}` — "
-                + ", ".join(sorted(i.get("ops", [])))
-                for i in record.items
-            ]
+            item_lines = [self._item_line(i) for i in record.items]
             head += "\n" + "\n".join(item_lines)
         if undo:
             head += (
@@ -597,7 +818,12 @@ class ApprovalGatewayCore:
         return head
 
     def _status_lines(self) -> list[str]:
-        lines = ["**Active grants**"]
+        """The room's state block: active grants with their remaining
+        TTL, then what is awaiting the approver. Item lines are the same
+        template-controlled form as a request — a shared room shows
+        every broker's items in one visual language."""
+        lines = [f"{ICON_STATUS} **STATUS**"]
+        lines.append("**Active grants**")
         active = [r for r in self._store.all_records() if r.state == "active"]
         if not active:
             lines.append("none")
@@ -605,25 +831,21 @@ class ApprovalGatewayCore:
             assert rec.expires_at is not None  # active grants always carry expiry
             remaining = format_remaining(rec.expires_at - self._now())
             lines.append(
-                f"✅ **#{rec.request_number}** — "
+                f"{ICON_ACTIVE} **#{rec.request_number}** — "
                 + "+".join(sorted({op for i in rec.items for op in i["ops"]}))
                 + f", {remaining} left"
             )
-            for item in rec.items:
-                lines.append(
-                    f"   **{item['backend']}** {item['account']}:`{item['resource']}` — "
-                    + ", ".join(sorted(item.get("ops", [])))
-                )
+            lines += [self._item_line(item) for item in rec.items]
         lines.append("")
         pending = [r for r in self._store.all_records() if r.state == "pending"]
         if not pending:
-            lines.append("Awaiting your approval: none")
+            lines.append("**Awaiting your approval** — none")
         else:
             lines.append(f"**Awaiting your approval** ({len(pending)}):")
             now = self._now()
             for rec in pending:
                 age = format_remaining(now - rec.created_at)
-                line = f"⏳ **#{rec.request_number}** — waiting {age}"
+                line = f"{ICON_PENDING} **#{rec.request_number}** — waiting {age}"
                 if now - rec.created_at >= timedelta(hours=4):
                     line += " — **stale?**"
                 elif now - rec.created_at >= timedelta(hours=1):
@@ -631,19 +853,19 @@ class ApprovalGatewayCore:
                 lines.append(line)
         footer_parts = []
         if pending:
-            footer_parts.append("Decide a request: `approve|reject <id> [expiry]`")
+            footer_parts.append("Decide: `approve|reject <id> [expiry]`")
         if active:
             footer_parts.append("Kill: `revoke <id>` (mass: `revoke all`)")
         if footer_parts:
             lines.append("")
-            lines.append(" · ".join(f"`{p}`" for p in footer_parts))
+            lines.append(" · ".join(footer_parts))
         return lines
 
     def _status_text(self) -> str:
         return "\n".join(self._status_lines())
 
     async def _post_summary(self) -> None:
-        await self._transport.send_message(self._status_text())
+        await self._post(self._status_text())
 
     # ------------------------------------------------------------ housekeeping
 
@@ -662,9 +884,10 @@ class ApprovalGatewayCore:
                 self._swept.add(rec.request_number)
                 if rec.state == "pending":
                     continue  # not yet timed out; noticed only on real expiry
-                await self._transport.send_message(
-                    f"Request #{rec.request_number} expired unanswered. "
-                    "Silence grants nothing."
+                await self._post(
+                    f"{ICON_EXPIRED} **Request #{rec.request_number} expired"
+                    " unanswered** — silence grants nothing. File a new request"
+                    " if access is still needed."
                 )
 
     async def request_state(self, request_number: int) -> RequestState:

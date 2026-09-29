@@ -120,8 +120,13 @@ lives in CHANGELOG.md and grows with each broker release.
   2026-09-18).
 - **`gateways`**: the ApprovalGateway interface and the
   transport-agnostic decision core (allowlist first, one-time numbers,
-  undo windows, expiry sweep, approval summaries). Platform adapters
-  (Matrix, Telegram, Teams, Signal shells) stay per-broker.
+  undo windows, expiry sweep, approval summaries, shared-room routing
+  with a leading `[tag]` on every outbound message). One message format
+  grammar serves the whole suite: `[tag] <icon> **<headline>**`, item
+  identity on one template-controlled line per item, the agent's
+  justification isolated in one labelled line, Matrix-safe markdown
+  only (no tables). Platform adapters (Matrix, Telegram, Teams, Signal
+  shells) stay per-broker.
 - **`auth`**: RFC 9728/8707 OAuth 2.1 resource-server validation (HTTP
   transport) and constant-time bearer checks (stdio).
 - **`baselines`**: BaselineEngine, standing T0/T1 permission

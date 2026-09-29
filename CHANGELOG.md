@@ -3,6 +3,54 @@
 All notable changes to this project are documented in this file.
 Format based on Keep a Changelog; versioning is SemVer.
 
+## [Unreleased] - 2026-09-29 (render pass appended; 2026-09-21 entry below)
+
+**Released as 0.1.2** (commit-time version bump per the design note;
+the 2026-09-21 entry below ships in the same release).
+
+### Changed
+
+- Approval-room message formats unified across every outbound type
+  (request, approve/reject/revoke confirmations, revoke-all, status,
+  lifecycle, expiry notice, undo-closed, refusals, parse errors, help,
+  audit-failure warning). One grammar everywhere: `[tag] <icon>
+  **<headline>**`, decision confirmations reuse the reaction emoji that
+  produced them, item lines are one template-controlled line each
+  (`<n>.` in requests, `•` elsewhere) and the agent-supplied
+  justification is isolated in ONE labelled line
+  (`Justification (agent, unverified):`). Request items are now
+  numbered one-per-line with the resource in code and ops in code; the
+  item count and default expiry moved into the request header; the
+  status block gained a `📋 **STATUS**` header; refusal text renders
+  the store's RejectReason as a sentence. No tables (Element X
+  collapses them). Rendering stays pure (no I/O, no clock) and every
+  decision/audit semantic is untouched.
+- `revoke all` confirmation now states that a bulk revoke has no undo
+  (the undo windows are armed per id, never for a bulk action).
+
+## [Unreleased] - 2026-09-21
+
+### Added
+
+- Shared-room routing (Option B, owner decision 2026-09-21): one
+  approval room may serve several broker gateways. Each gateway
+  declares `shared_room: true` + `command_prefix` in its gateway
+  config (refuse-to-start validated: a shared room requires a
+  nonempty prefix; a prefix without a shared room is refused as dead
+  config). Inbound: commands must carry the tag (`comms approve 1`);
+  unprefixed commands are refused with a hint (fail-closed), other
+  brokers' prefixed commands are ignored silently. Outbound: every
+  message is stamped `[tag] ...` through a single `_post` choke
+  point.
+- `announce_lifecycle`: the gateway posts `gateway started` /
+  `gateway stopping` notices to the approval room (owner directive);
+  delivery failure is logged and swallowed.
+- Grant items accept a display-only `label` (e.g. the Matrix room
+  name) shown on request lines and decisions; the policy wall never
+  reads it and matching stays by `resource`.
+- `GrantStore` refuses a grants DB whose parent directory does not
+  exist (named error, fail-closed boot).
+
 ## [0.1.0] - 2026-09-18 (founding release)
 
 ### Added (by extraction, provenance in AUTHORS.md)

@@ -835,3 +835,15 @@ def test_store_rejects_duration_override_type_confusion(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="duration"):
             store.approve(req, bad)  # type: ignore[arg-type]
     assert store.get(req) is RequestState.PENDING
+
+
+# ------------------------------------------------- storage preflight
+
+
+def test_missing_parent_dir_refuses_named(tmp_path: Path) -> None:
+    """A grants_db under a nonexistent directory refuses at construction
+    with a named error (not sqlite3.OperationalError 'unable to open
+    database file', the opaque form Nasser hit live 2026-09-21 when the
+    storage dir was not created before first boot)."""
+    with pytest.raises(ValueError, match="parent directory does not exist"):
+        GrantStore(str(tmp_path / "nope" / "g.db"), clock=lambda: None, registry=_store_registry())
