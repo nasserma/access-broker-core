@@ -135,6 +135,18 @@ lives in CHANGELOG.md and grows with each broker release.
 - **`custody`**: CustodyRegistry/CustodyClass, the machine-readable
   custody-class declaration layer (S6-1); declarations are
   refuse-to-start validated and ride every audit record.
+- **`screening`** (v0.2.0, optional): the deterministic content screen
+  engine — the content-direction wall that runs BEHIND the access wall.
+  Pure, synchronous, no I/O. Per-rule `block` (default, fail-safe) or
+  `flag` action; fail-closed on malformed payload and engine errors
+  (`screen_error`, never a rule hit); refuse-to-start on malformed
+  config; screen off (absent `screening:` key) is byte-identical
+  broker behavior. Deterministic rules scan full bytes; the 8 KiB
+  MODEL_WINDOW_BYTES cap is dormant until the later model annotator
+  lands (a config enabling `screening.model` refuses to start). The
+  screen verdict rides the audit record's optional `screen` field and,
+  for pending requests, one bounded line on the approval card. Design
+  note: `review/contentScreeningDesignNote-2026-10-01.md`.
 
 ## What brokers own
 
@@ -161,6 +173,12 @@ an exemption from it.
    principal.
 6. The T0/T1 free lane exists in every broker; gating reads and
    reversible writes trains the owner to approve reflexively.
+7. The content screen annotates or refuses content, never access: a
+   screen result feeds no grant, tier classification, or policy
+   decision. Deterministic rules may block a content transit the wall
+   already allowed (per-rule, default block); a model screen, when it
+   exists, may only annotate. The screen grants nothing and widens
+   nothing.
 
 ## Verification model
 

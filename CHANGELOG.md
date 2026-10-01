@@ -3,6 +3,47 @@
 All notable changes to this project are documented in this file.
 Format based on Keep a Changelog; versioning is SemVer.
 
+## [0.2.0] - 2026-10-01
+
+### Added
+
+- **`screening`: deterministic content-screen engine (Stage 1 of the
+  content-screening plan; design note
+  `review/contentScreeningDesignNote-2026-10-01.md`, all decisions
+  owner-resolved 2026-10-01).** A content-direction wall BEHIND the
+  access wall: deterministic rules inspect what a legitimately
+  authorized operation is about to move, inbound or outbound. Pure,
+  synchronous, no I/O. Per-rule action `block` (default, fail-safe) or
+  `flag` (annotate and proceed) — owner ruling 2026-10-01. Fail-closed:
+  malformed payload and engine errors REFUSE with `screen_error`
+  (an engine error is never a rule hit). Refuse-to-start on malformed
+  config (unknown action/direction, bad regex, duplicate names, a
+  `screening.model` block with `enabled: true` — the model annotator
+  does not exist yet). Absent `screening:` key = screen off =
+  byte-identical broker behavior. Deterministic rules scan FULL bytes;
+  `MODEL_WINDOW_BYTES` (8 KiB) is dormant until the model arm lands
+  later as a config flip (resolved decision 3). Seed rule vocabulary:
+  secret_bearer_token, secret_private_key (both directions),
+  injection_ignore_instructions, injection_reveal_system (inbound).
+- **Audit `screen` field (Stage 2):** optional record field carrying
+  the screen verdict — fixed vocabulary (clear | flagged | refused |
+  unscreened | model_unavailable | screen_error), fail-closed gate
+  before write, hashed inside the record (custody-pattern seam, S6-1).
+  None = undeclared; legacy lines verify unchanged.
+- **Approval-card screen line (Stage 2):** one bounded labelled line
+  (`Screen (advisory, deterministic)`) directly below the justification
+  on a pending request, rendered ONLY when the adopting broker's screen
+  produced a result; never item identity, never a reaction
+  (bounded-approval-context invariant). `render_request`,
+  `post_request`, `notify_request` gain a keyword-only `screen=None`
+  parameter — all existing positional callers unchanged (blast-radius
+  verified across all five suites).
+
+### Changed
+
+- Version 0.1.2 → 0.2.0 (minor: additive optional module + optional
+  audit/card fields; no behavior change for non-adopting brokers).
+
 ## [Unreleased] - 2026-09-29 (render pass appended; 2026-09-21 entry below)
 
 **Released as 0.1.2** (commit-time version bump per the design note;
