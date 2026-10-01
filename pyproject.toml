@@ -1,6 +1,6 @@
 [project]
 name = "access-broker-core"
-version = "0.1.2"
+version = "0.2.0"
 description = "Shared security architecture for the access-broker suite: grant lifecycle, tier evaluation, hash-chained audit, transport auth, approval-gateway substrate."
 readme = "README.md"
 license = "GPL-3.0-or-later"
