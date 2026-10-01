@@ -634,3 +634,76 @@ def test_no_rotation_growth_unbounded(tmp_path):
     for i in range(200):
         record(log, resource=f"f{i}")
     assert verify_chain(tmp_path / "audit.log").lines == 200
+
+
+# ------------------------------------------- screen field (S2, design note 2026-10-01)
+
+
+def test_screen_field_written_when_declared(tmp_path):
+    """A declared screen verdict rides the record and the chain."""
+    log = make_log(tmp_path)
+    record(log, screen="refused")
+    lines = lines_of(tmp_path)
+    rec = json.loads(lines[0])
+    assert rec["screen"] == "refused"
+    assert verify_chain(tmp_path / "audit.log").ok
+
+
+def test_screen_field_absent_when_none(tmp_path):
+    """None means no declaration: the field is absent (legacy shape)."""
+    log = make_log(tmp_path)
+    record(log)
+    rec = json.loads(lines_of(tmp_path)[0])
+    assert "screen" not in rec
+    assert verify_chain(tmp_path / "audit.log").ok
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["clear", "flagged", "refused", "unscreened", "model_unavailable", "screen_error"],
+)
+def test_screen_vocabulary_accepted(tmp_path, value):
+    log = make_log(tmp_path)
+    record(log, screen=value)
+    assert json.loads(lines_of(tmp_path)[0])["screen"] == value
+    assert verify_chain(tmp_path / "audit.log").ok
+
+
+def test_screen_unknown_value_refused_before_write(tmp_path):
+    """Fail-closed vocabulary gate: an unknown verdict is refused and
+    leaves NO partial record (the entry is built after the checks)."""
+    log = make_log(tmp_path)
+    with pytest.raises(ValueError, match="screen"):
+        record(log, screen="probably-fine")
+    assert not (tmp_path / "audit.log").exists()
+
+
+def test_screen_field_is_chained(tmp_path):
+    """Editing the screen field of an existing line is detected."""
+    log = make_log(tmp_path)
+    record(log, screen="clear")
+    rec = json.loads(lines_of(tmp_path)[0])
+    rec["screen"] = "refused"  # tampered
+    (tmp_path / "audit.log").write_text(json.dumps(rec, sort_keys=True) + "\n")
+    result = verify_chain(tmp_path / "audit.log")
+    assert not result.ok
+    assert "hash mismatch" in (result.error or "")
+
+
+def test_legacy_lines_without_screen_verify(tmp_path):
+    """A pre-screening line followed by a screened line: both verify."""
+    log = make_log(tmp_path)
+    record(log, resource="legacy")
+    record(log, resource="screened", screen="flagged")
+    assert verify_chain(tmp_path / "audit.log").lines == 2
+
+
+def test_screen_secret_check_still_applies(tmp_path):
+    """A record VALUE containing a configured secret is refused even
+    when a screen verdict is declared alongside it (the screen field
+    does not bypass the secret-scrubbing gate)."""
+    log = AuditLog(
+        path=tmp_path / "audit.log", clock=lambda: NOW, secrets=["hunter2"]
+    )
+    with pytest.raises(ValueError, match="secret"):
+        record(log, reason="password is hunter2", screen="clear")

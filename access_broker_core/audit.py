@@ -35,12 +35,13 @@ Goal contract requirements (unchanged from the reference):
 Record format (one JSON object per line, canonical key order):
   {"timestamp": ..., "account": ..., "backend": ..., "resource": ...,
    "operation": ..., "grant_id": ..., "decision": ..., "reason": ...,
-   "principal": ..., "custody": ..., "prev_sha256": ..., "sha256": ...}
+   "principal": ..., "custody": ..., "screen": ..., "prev_sha256": ..., "sha256": ...}
 
 The chain hash is computed over the record WITHOUT prev_sha256, so a
 record's own hash does not depend on the chain position of its writer,
 and verify_chain() recomputes identically. Optional fields (backend,
-principal) are hashed only when present, so legacy lines still verify.
+principal, custody, screen) are hashed only when present, so legacy
+lines still verify.
 
 Truncation detection: a hash chain alone cannot detect the loss of its
 own tail (a shorter chain is internally consistent). So every write also
@@ -79,6 +80,7 @@ _CHAINED_FIELDS = (
     "reason",
     "principal",
     "custody",
+    "screen",
 )
 
 #: Tier-2 lifecycle event types (goal contract D5): the values written in
@@ -94,6 +96,33 @@ LIFECYCLE_EVENTS = frozenset(
 #: record's ``custody`` field may carry. Anything else is refused
 #: before write.
 _CUSTODY_VALUES = frozenset(c.value for c in CustodyClass)
+
+#: The recognized screen vocabulary (content-screening design note
+#: 2026-10-01, Stage 2): the fixed string values a record's optional
+#: ``screen`` field may carry — the deterministic engine's verdicts,
+#: plus the model-arm postures reserved for the later annotator
+#: (``unscreened``, ``model_unavailable``). Anything else is refused
+#: before write; the chain must never carry a screen statement outside
+#: the vocabulary (same fail-closed discipline as custody).
+SCREEN_VALUES = frozenset(
+    {
+        "clear",
+        "flagged",
+        "refused",
+        "unscreened",
+        "model_unavailable",
+        "screen_error",
+    }
+)
+
+
+def _check_screen_value(screen) -> None:
+    """Fail-closed vocabulary gate on the optional screen field (the
+    same seam discipline as custody): runs BEFORE the entry is built,
+    so a refused value leaves no partial record behind."""
+    if screen is None or screen in SCREEN_VALUES:
+        return
+    raise ValueError(f"refusing to record screen value {screen!r}: not a recognized screen verdict")
 
 
 def _check_custody_value(custody) -> None:
@@ -228,6 +257,7 @@ class AuditLog:
         backend: str | None = None,
         principal: str | None = None,
         custody: str | CustodyClass | None = None,
+        screen: str | None = None,
     ) -> object:
         """Write the audit entry, flush, then run ``then``. Returns whatever
         ``then`` returns, or None when ``then`` is not given.
@@ -255,12 +285,25 @@ class AuditLog:
         (LIFECYCLE_EVENTS); each execution writes its intent entry
         BEFORE the backend call via ``then``.
 
+        screen carries the content-screening verdict for the call
+        (content-screening design note 2026-10-01): one of the fixed
+        SCREEN_VALUES vocabulary ('clear' | 'flagged' | 'refused' |
+        'unscreened' | 'model_unavailable' | 'screen_error'). It is
+        part of the chain hash but optional, so legacy lines still
+        verify. None means a caller that does not declare a screen
+        (screen off, or a broker that has not adopted the layer); a
+        clear verdict is recorded explicitly as 'clear' when the screen
+        ran and passed. Any OTHER string value is refused before write
+        (fail-closed: the chain must never carry a screen statement
+        outside the recognized vocabulary).
+
         Raises LogWriteError when the write fails (callback NOT run).
         Raises ValueError when a field would contain a configured secret
         (also NOT run - and not written).
         """
         self._check_secrets(account, resource, operation, decision, reason)
         _check_custody_value(custody)
+        _check_screen_value(screen)
 
         entry = {
             "timestamp": self._clock().isoformat(),
@@ -279,6 +322,8 @@ class AuditLog:
             entry["custody"] = (
                 custody.value if isinstance(custody, CustodyClass) else custody
             )
+        if screen is not None:
+            entry["screen"] = screen
         line_record = dict(entry)
         line_record["prev_sha256"] = self._prev_sha256
         line_record["sha256"] = hashlib.sha256(_chain_payload(entry).encode()).hexdigest()

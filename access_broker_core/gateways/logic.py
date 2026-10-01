@@ -132,6 +132,11 @@ BULLET = "•"
 
 # The one labelled line the agent-supplied free text may occupy.
 JUSTIFICATION_LABEL = "Justification (agent, unverified)"
+#: Content-screening verdict line label (design note 2026-10-01):
+#: rendered ONLY when the adopting broker's screen produced a result —
+#: bounded, one line, never part of item identity or the decision
+#: reactions (bounded-approval-context invariant).
+SCREEN_LABEL = "Screen (advisory, deterministic)"
 
 _RULE = "———"
 
@@ -410,14 +415,23 @@ class ApprovalGatewayCore:
         tables)."""
         return f"\n\n{_RULE}\n\n".join(parts)
 
-    def render_request(self, number: int, justification: str, items: list[dict]) -> str:
+    def render_request(
+        self,
+        number: int,
+        justification: str,
+        items: list[dict],
+        screen: str | None = None,
+    ) -> str:
         """Markdown for a pending request: the header names the id, the
         item count and the default expiry (the three things the
         approver decides between), each item is ONE template-controlled
         line (backend/account/resource + ops) so item identity survives
         phone-width wrapping, and the agent-supplied justification sits
         in its own labelled line as commentary — never as the approval
-        target."""
+        target. screen: optional bounded verdict line from the content
+        screen (design note 2026-10-01), rendered directly below the
+        justification; None = no screen ran and the card is
+        byte-identical to the pre-screening card."""
         count = len(items)
         lines = [
             f"{ICON_PENDING} **PENDING #{number}** — awaiting your approval"
@@ -425,8 +439,10 @@ class ApprovalGatewayCore:
             f" {DEFAULT_EXPIRY_LABEL} if approved",
         ]
         lines += [self._item_line(item, i) for i, item in enumerate(items, start=1)]
+        lines += [f"{JUSTIFICATION_LABEL}: {justification}"]
+        if screen is not None:
+            lines.append(f"{SCREEN_LABEL}: {screen}")
         lines += [
-            f"{JUSTIFICATION_LABEL}: {justification}",
             "",
             f"**Decide** — {APPROVE_EMOJI} `approve {number}`, or"
             f" {REJECT_EMOJI} `reject {number}`"
@@ -435,14 +451,22 @@ class ApprovalGatewayCore:
         ]
         return "\n".join(lines)
 
-    async def post_request(self, number: int, justification: str, items: list[dict]) -> str:
+    async def post_request(
+        self,
+        number: int,
+        justification: str,
+        items: list[dict],
+        *,
+        screen: str | None = None,
+    ) -> str:
         """Post a pending request and pre-place the four decision
         reactions (transports without reactions no-op). Returns the
         posted event id. The event→request mapping is in-memory only —
         sound because the store rejects all pending requests at restart,
-        so post-restart reactions resolve to nothing."""
+        so post-restart reactions resolve to nothing. screen: optional
+        screen verdict line (render_request)."""
         event_id = await self._post(
-            self.render_request(number, justification, items)
+            self.render_request(number, justification, items, screen=screen)
         )
         for emoji in DECISION_EMOJIS:
             await self._transport.add_reaction(event_id, emoji)
@@ -450,14 +474,27 @@ class ApprovalGatewayCore:
         return event_id
 
     async def notify_request(
-        self, request_number: int, justification: str, items: list[dict]
+        self,
+        request_number: int,
+        justification: str,
+        items: list[dict],
+        *,
+        screen: str | None = None,
     ) -> str:
         """Public entry point: render + post one pending request.
 
-        The submission decision is audited here (human-plane view of the
-        agent's submit; agent-side ``submitted`` entries come from
+        The submission decision is audited here (human-plane view of
+        the agent's submit; agent-side ``submitted`` entries come from
         tools.py). Audit-write failure does NOT un-post the request —
-        the submission is non-widening — but is surfaced loudly."""
+        the submission is non-widening — but is surfaced loudly.
+
+        screen (keyword-only, content-screening design note
+        2026-10-01): the screening verdict line rendered next to the
+        justification when a broker's screen produced one. None = no
+        screen ran: the card is byte-identical to today's. Never part
+        of item identity, never a reaction (bounded-approval-context
+        invariant).
+        """
         try:
             self._audit_decision(
                 request_number, "submitted", "pending_approval", self._approver, items
@@ -468,7 +505,7 @@ class ApprovalGatewayCore:
                 request_number,
                 exc,
             )
-        return await self.post_request(request_number, justification, items)
+        return await self.post_request(request_number, justification, items, screen=screen)
 
     # ------------------------------------------------------------ reactions
 

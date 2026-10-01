@@ -41,6 +41,7 @@ from access_broker_core.gateways.logic import (
     MESSAGE_ICONS,
     REJECT_EMOJI,
     REVOKE_EMOJI,
+    SCREEN_LABEL,
     STATUS_EMOJI,
     ApprovalGatewayCore,
     GatewayTransport,
@@ -1279,3 +1280,52 @@ def test_no_markdown_tables_anywhere(core_env):
     for text in texts:
         for line in text.splitlines():
             assert not re.match(r"^\s*\|.*\|\s*$", line), line
+
+
+# ------------------------------------------- screen line (S2, design note 2026-10-01)
+
+
+def test_screen_absent_by_default(core_env):
+    core, store, transport = make_core(core_env)
+    text = core.render_request(3, "j", [ITEM])
+    assert SCREEN_LABEL not in text
+
+
+def test_screen_line_shape(core_env):
+    core, store, transport = make_core(core_env)
+    text = core.render_request(3, "j", [ITEM], screen="flagged: test_rule")
+    screen_lines = [ln for ln in text.splitlines() if ln.startswith(SCREEN_LABEL)]
+    assert screen_lines == [f"{SCREEN_LABEL}: flagged: test_rule"]
+    # sits directly below the justification line
+    lines = text.splitlines()
+    assert lines.index(f"{SCREEN_LABEL}: flagged: test_rule") == (
+        lines.index(f"{JUSTIFICATION_LABEL}: j") + 1
+    )
+
+
+def test_screen_line_not_item_identity(core_env):
+    """The screen line never lands in item identity lines (bounded-
+    approval-context invariant)."""
+    core, store, transport = make_core(core_env)
+    text = core.render_request(3, "j", FIVE_BROKER_ITEMS, screen="refused: r1")
+    item_lines = [ln for ln in text.splitlines() if re.match(r"^\d+\. ", ln)]
+    assert len(item_lines) == len(FIVE_BROKER_ITEMS)
+    assert all("refused" not in ln for ln in item_lines)
+
+
+def test_screen_line_is_single_and_bounded(core_env):
+    """The verdict appears verbatim exactly once, on the labelled line."""
+    core, store, transport = make_core(core_env)
+    text = core.render_request(2, "j", [ITEM], screen="clear")
+    assert text.count("clear") == 1
+    labelled = [ln for ln in text.splitlines() if ln.startswith(SCREEN_LABEL)]
+    assert labelled == [f"{SCREEN_LABEL}: clear"]
+
+
+async def test_post_request_passes_screen(core_env):
+    """post_request forwards the screen verdict to the renderer."""
+    core, store, transport = make_core(core_env)
+    event_id = await core.post_request(3, "j", [ITEM], screen="flagged: r")
+    assert event_id == "evt-1"
+    posted = transport.sent[0]
+    assert f"{SCREEN_LABEL}: flagged: r" in posted
