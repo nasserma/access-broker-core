@@ -60,7 +60,29 @@ request access TO it — ``approval_surface_ids()`` +
 ``register_protected_surfaces()`` put every route id into the broker's
 protected-surface set, the same guard the communications broker applies
 to its approval room (an agent-influenced ``request_access`` naming an
-approval route is refused before the wall sees it).
+approval route is refused before the wall sees it). As of this round
+(review V6f) that registration is BY DEFAULT: building the surface
+unions its route ids into ``core.protected_surfaces`` (the core exposes
+``core.is_protected_surface``), matched on NORMALIZED paths (query
+string and trailing slashes stripped), so a broker does not need a
+separate opt-in step a wall could forget and a variant path cannot
+bypass the set.
+
+DECISION-ID REPLAY (review V1): a client ``decision_id`` binds the id
+to the FULL decision tuple (request_number, action, duration) for a
+bounded TTL (``REPLAY_TTL_SECONDS``). A retry with the SAME tuple
+answers idempotently — re-read from the EFFECTIVE grant state, never
+from a cached outcome body. A retry reusing the id with a DIFFERENT
+tuple is a decision-id CONFLICT refusal (audited, nothing applied),
+never a replay of the old outcome. Cache entries — refusals included —
+expire with the TTL, so a mistyped id can never pin a stale answer;
+after expiry the id is decided fresh.
+
+UNDO LIMITATION (review V6h): the 15s undo window is armed on
+reject/revoke exactly as in the room path, but it can be consumed ONLY
+from the approval ROOM (``undo <id>`` typed there creates a NEW pending
+request). An API decision cannot be undone from the API in this
+release — there is no API undo verb (an owner decision, pending).
 """
 
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -71,6 +93,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from datetime import timedelta
@@ -78,7 +101,7 @@ from importlib import metadata
 from typing import Any
 
 from access_broker_core.auth.static import check_static_credential
-from access_broker_core.gateways.logic import DECISION_ACTIONS
+from access_broker_core.gateways.logic import DECISION_ACTIONS, normalize_surface_id
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +128,13 @@ MAX_DURATION_SECONDS = 999 * 24 * 60 * 60
 #: Replay cache bound: one entry per client-supplied decision_id, FIFO.
 MAX_REPLAY_ENTRIES = 256
 
+#: Replay-window TTL in seconds (review V1): a cached decision binding —
+#: refusals included — expires after this window, after which the same
+#: decision_id is decided FRESH (a mistyped id can never pin a stale
+#: answer; nothing is ever replayed from a cached outcome body, only
+#: re-read from the effective grant state inside the window).
+REPLAY_TTL_SECONDS = 300.0
+
 _MAX_DECISION_ID_LENGTH = 128
 _MAX_SURFACE_ID_LENGTH = 256
 
@@ -120,6 +150,13 @@ REASON_INVALID_ACTION = "invalid_action"
 REASON_INVALID_DURATION = "invalid_duration"
 REASON_INVALID_DECISION_ID = "invalid_decision_id"
 REASON_INVALID_REQUEST = "invalid_request"
+#: A decision_id reused for a DIFFERENT decision tuple (review V1): a
+#: conflict, never a replay of the old outcome — nothing is applied.
+REASON_DECISION_ID_CONFLICT = "decision_id_conflict"
+#: The decision path failed unexpectedly (review V2): answered through
+#: the STRUCTURED refusal/error paths (audited, HTTP 200 body), never a
+#: raw 500 without a chain trace.
+REASON_INTERNAL_ERROR = "internal_error"
 
 _SURFACE_OPTION_KEYS = frozenset(
     {
@@ -146,6 +183,8 @@ _HTTP_HINTS = {
     REASON_INVALID_DURATION: 422,
     REASON_INVALID_DECISION_ID: 400,
     REASON_INVALID_REQUEST: 400,
+    REASON_DECISION_ID_CONFLICT: 409,
+    REASON_INTERNAL_ERROR: 500,
 }
 
 
@@ -188,7 +227,10 @@ def approval_surface_ids(mount_prefix: str = DEFAULT_MOUNT_PREFIX) -> frozenset[
 
 
 def _normalize_surfaces(surfaces: Iterable[str]) -> frozenset[str]:
-    """Validate reserved surface ids (one bounded line each)."""
+    """Validate reserved surface ids (one bounded line each) and store
+    them in CANONICAL matching form (review V6f): the query string and
+    trailing slashes are stripped, so a variant of a protected id
+    cannot slip past an exact-match lookup."""
     if isinstance(surfaces, str):
         surfaces = (surfaces,)
     out: set[str] = set()
@@ -202,6 +244,7 @@ def _normalize_surfaces(surfaces: Iterable[str]) -> frozenset[str]:
         text = surface.strip()
         if not text:
             raise ValueError("surface id must be a non-empty string")
+        text = normalize_surface_id(text)
         if len(text) > _MAX_SURFACE_ID_LENGTH or _CONTROL_CHARS.search(text):
             raise ValueError("surface id must be one bounded line")
         out.add(text)
@@ -320,6 +363,23 @@ class ApprovalSurfaceApp:
             )
         if not callable(getattr(core, "snapshot", None)):
             raise ValueError("approval surface: core must expose snapshot()")
+        if not callable(getattr(core, "replayed_decision", None)):
+            raise ValueError(
+                "approval surface: core must expose replayed_decision() "
+                "(the idempotent re-read a decision_id replay answers from)"
+            )
+        if (
+            isinstance(min_token_length, bool)
+            or not isinstance(min_token_length, int)
+            or min_token_length < MIN_TOKEN_LENGTH
+        ):
+            # Review V6g: the token floor is HARD. A configured value below
+            # 32 refuses to start — the floor is never silently lowered.
+            raise ValueError(
+                f"approval surface: min_token_length must be an integer >= "
+                f"{MIN_TOKEN_LENGTH} (the token floor cannot be lowered; "
+                "refusing to start)"
+            )
         if not isinstance(token, str) or len(token) < min_token_length:
             raise ValueError(
                 f"approval surface: bearer must be at least {min_token_length} "
@@ -338,7 +398,15 @@ class ApprovalSurfaceApp:
         self._broker_id = broker_id
         self._version = version or _package_version()
         self._max_body_bytes = max_body_bytes
+        # decision_id -> {"fingerprint": (request_number, action,
+        # duration_seconds), "expires_at": monotonic deadline}
         self._replays: OrderedDict[str, dict] = OrderedDict()
+        # Review V6f: protected BY DEFAULT — the surface ids ride the core
+        # itself (core.protected_surfaces / core.is_protected_surface), so
+        # a broker that mounts this surface does not depend on a separate
+        # opt-in registration step its wall could forget.
+        if hasattr(core, "protected_surfaces"):
+            register_protected_surfaces(core, approval_surface_ids(self._mount_prefix))
 
     # ------------------------------------------------------------ properties
 
@@ -446,14 +514,50 @@ class ApprovalSurfaceApp:
             await self._refuse(send, None, parsed)
             return
         request_number, action, duration, decision_id = parsed
+        # Review V1: the replay binding is the FULL decision tuple, not
+        # the id alone — the same decision_id naming a different decision
+        # is a conflict, never a replay of the old outcome.
+        fingerprint = (
+            request_number,
+            action,
+            duration.total_seconds() if duration is not None else None,
+        )
 
         if decision_id is not None:
             cached = self._replays.get(decision_id)
+            if cached is not None and time.monotonic() >= cached["expires_at"]:
+                # TTL (review V1): refusals included — no id ever pins a
+                # stale answer; after expiry the decision runs fresh.
+                self._replays.pop(decision_id, None)
+                cached = None
             if cached is not None:
-                replay = dict(cached)
-                replay["replayed"] = True
-                replay["http_hint"] = cached.get("http_hint", 200)
-                await self._json(send, 200, replay)
+                if cached["fingerprint"] != fingerprint:
+                    # The same id bound to a DIFFERENT decision tuple:
+                    # audited conflict refusal, nothing applied, and the
+                    # original binding STANDS (a retry of the first
+                    # decision still answers idempotently).
+                    await self._refuse(send, request_number, REASON_DECISION_ID_CONFLICT)
+                    return
+                # Matching tuple: answer from the CURRENT effective grant
+                # state (re-read), never from a stale cached body (V1).
+                try:
+                    outcome = await self._core.replayed_decision(
+                        request_number, action, self._principal
+                    )
+                except Exception:  # noqa: BLE001 - a replay never applies anything
+                    logger.exception(
+                        "approval surface: replayed decision re-read failed "
+                        "(request #%s action=%s)",
+                        request_number,
+                        action,
+                    )
+                    await self._refuse(send, request_number, REASON_INTERNAL_ERROR)
+                    return
+                payload = dict(outcome)
+                payload["surface"] = "approval"
+                payload["replayed"] = True
+                payload["http_hint"] = self._http_hint(outcome)
+                await self._json(send, 200, payload)
                 return
 
         try:
@@ -475,15 +579,30 @@ class ApprovalSurfaceApp:
                 request_number,
                 action,
             )
+            if action in ("reject", "revoke"):
+                # Review V2: non-widening by construction (capability
+                # only ever shrinks) — the structured refusal path is
+                # always a safe answer for a reject/revoke fault.
+                await self._refuse(send, request_number, REASON_INTERNAL_ERROR)
+                return
+            # Widening path (approve): a genuine server error must NOT
+            # masquerade as a decision outcome — a structured ERROR body
+            # (HTTP 200, ok=false, outcome=error), audited, never a raw
+            # 500 without a chain trace.
+            self._core.audit_surface_refusal(
+                request_number, REASON_INTERNAL_ERROR, principal="surface:approval"
+            )
             await self._json(
                 send,
-                500,
+                200,
                 {
                     "ok": False,
                     "outcome": "error",
                     "request_number": request_number,
                     "action": action,
-                    "error": "internal_error",
+                    "error": REASON_INTERNAL_ERROR,
+                    "surface": "approval",
+                    "http_hint": 500,
                 },
             )
             return
@@ -492,7 +611,7 @@ class ApprovalSurfaceApp:
         payload["surface"] = "approval"
         payload["http_hint"] = self._http_hint(outcome)
         if decision_id is not None:
-            self._remember(decision_id, payload)
+            self._remember(decision_id, fingerprint)
         await self._json(send, 200, payload)
 
     # ------------------------------------------------------------ helpers
@@ -503,9 +622,15 @@ class ApprovalSurfaceApp:
             return 200
         return _HTTP_HINTS.get(str(outcome.get("refusal")), 409)
 
-    def _remember(self, decision_id: str, payload: dict) -> None:
-        """Bound the replay cache (oldest out first)."""
-        self._replays[decision_id] = dict(payload)
+    def _remember(self, decision_id: str, fingerprint: tuple[int, str, float | None]) -> None:
+        """Bind a decision_id to its decision tuple for the replay TTL
+        (oldest binding out first). The cached OUTCOME body is never
+        stored: a replay answers from the live record, so nothing stale
+        can ever be served back."""
+        self._replays[decision_id] = {
+            "fingerprint": fingerprint,
+            "expires_at": time.monotonic() + REPLAY_TTL_SECONDS,
+        }
         while len(self._replays) > MAX_REPLAY_ENTRIES:
             self._replays.popitem(last=False)
 
@@ -539,8 +664,13 @@ class ApprovalSurfaceApp:
         refused (a zero-length grant is not an approval).
         """
         try:
+            # Explicit parse boundary (review V2): json.loads raises
+            # ValueError for malformed JSON / non-UTF-8 bytes and
+            # RecursionError for a ~4KB deeply-nested depth bomb — BOTH
+            # are parse-stage refusals (audited, structured, nothing
+            # applied), never a raw 500 escaping the module contract.
             body = json.loads(raw)
-        except ValueError:  # includes UnicodeDecodeError on non-UTF-8 bytes
+        except (ValueError, RecursionError):
             return REASON_MALFORMED_BODY
         if not isinstance(body, dict):
             return REASON_MALFORMED_BODY
@@ -581,8 +711,13 @@ class ApprovalSurfaceApp:
         self, send: Any, request_number: int | None, reason: str
     ) -> None:
         """A body-level refusal: AUDITED with a fixed reason, answered
-        as a structured 200 body (nothing was applied)."""
-        head = self._core.audit_surface_refusal(
+        as a structured 200 body (nothing was applied).
+
+        The receipt head is advertised ONLY when the audit entry landed
+        (review V6b): the body carries ``audit_written`` and a head of
+        None on a failed write, never a receipt for an unwritten entry.
+        """
+        head, audit_written = self._core.audit_surface_refusal(
             request_number, reason, principal="surface:approval"
         )
         payload = {
@@ -596,6 +731,7 @@ class ApprovalSurfaceApp:
             "refusal": reason,
             "item_count": 0,
             "principal": "surface:approval",
+            "audit_written": audit_written,
             "audit_head": head,
             "announced": False,
             "notified": False,
@@ -640,7 +776,9 @@ def build_approval_surface_app(
       broker_id (str) — surfaced in /health (never in decisions).
       version (str) — override the reported version.
       max_body_bytes (int, default 4096).
-      min_token_length (int, default 32).
+      min_token_length (int, default 32) — a HARD floor: a configured
+      value below 32 REFUSES TO START (review V6g), it is never
+      clamped or lowered.
 
     Unknown option keys are refused (refuse-to-start discipline: a typo
     must not silently disable a guard).
@@ -657,8 +795,15 @@ def build_approval_surface_app(
     env_name = token_env_name.strip()
     token = os.environ.get(env_name)
     min_length = opts.get("min_token_length", MIN_TOKEN_LENGTH)
-    if isinstance(min_length, bool) or not isinstance(min_length, int) or min_length <= 0:
-        raise ValueError("approval surface: min_token_length must be a positive integer")
+    if isinstance(min_length, bool) or not isinstance(min_length, int):
+        raise ValueError("approval surface: min_token_length must be an integer")
+    if min_length < MIN_TOKEN_LENGTH:
+        # Review V6g: 32 is a HARD floor. A configured value below it
+        # REFUSES TO START — the floor is never clamped or lowered.
+        raise ValueError(
+            f"approval surface: min_token_length {min_length} is below the "
+            f"hard floor {MIN_TOKEN_LENGTH} (refusing to start)"
+        )
     if not token:
         raise ValueError(
             f"approval surface: credential env var {env_name!r} is unset or empty "

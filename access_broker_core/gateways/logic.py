@@ -116,6 +116,21 @@ _MAX_LABEL_RENDER = 128
 _MAX_SCREEN_RENDER = 256
 _MAX_ECHO_RENDER = 64
 
+#: Upper bound on rows per snapshot slice (review V6e): the snapshot is
+#: served to a poller, so an unbounded live-row count would make the
+#: response body unbounded. A store wedged past this many rows in one
+#: slice is TRUNCATED (rows kept in store order, oldest first) and the
+#: body carries ``truncated: true`` — a silent drop would let a client
+#: render "no pending" for a store that has more.
+SNAPSHOT_MAX_ROWS = 256
+
+#: How long an effectively-expired row stays visible in the snapshot's
+#: ``expired_recent`` slice (review V6e). Rows the store still holds as
+#: pending/active whose effective expiry is older than this window are
+#: dropped from the read model entirely, so the slice is bounded by
+#: recency instead of growing forever.
+SNAPSHOT_EXPIRED_WINDOW = timedelta(hours=24)
+
 #: Every character a transport may treat as a line break, or that
 #: renders as an invisible control inside a bot-authored card.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
@@ -320,6 +335,17 @@ REFUSAL_ALREADY_DECIDED = "already_decided"
 REFUSAL_EXPIRED = "expired"
 REFUSAL_AUDIT_WRITE_FAILED = "audit_write_failed"
 
+#: The effective (state, state_source) pairs each decision verb produces,
+#: consulted by :meth:`replayed_decision` to answer an idempotent replay
+#: from the LIVE record (review V1): a replay answers applied only when
+#: the store's current state is exactly what that verb would have
+#: written — anything else answers refused with the true state.
+_REPLAY_OUTCOMES: dict[str, frozenset[tuple[str, str | None]]] = {
+    "approve": frozenset({("active", "approval")}),
+    "reject": frozenset({("rejected", "rejection")}),
+    "revoke": frozenset({("revoked", "revocation"), ("rejected", "pending_revoke")}),
+}
+
 _PRINCIPAL_KINDS = frozenset({"approver", "agent", "hub", "surface", "transfer"})
 _MAX_PRINCIPAL_LENGTH = 128
 
@@ -353,15 +379,29 @@ def _normalize_decision_duration(duration: timedelta | str | None) -> timedelta 
     )
 
 
+def normalize_surface_id(value: str) -> str:
+    """Canonical form of a protected-surface id for MATCHING (review
+    V6f): strip any query string, then trailing slashes, so
+    ``/approval/decision?x=1`` and ``/approval/decision/`` both match
+    the registered ``/approval/decision`` — a path variant cannot
+    bypass the protected set. An empty or root result stays ``/``.
+    """
+    text = value.split("?", 1)[0].rstrip("/")
+    return text or "/"
+
+
 def _principal_label(principal: str) -> str:
     """Normalize an acting principal into the audit chain's label form.
 
-    ``approver:<id>`` for human decisions (the room passes the sender
-    and gets the prefix here), other declared kinds pass through
-    unchanged (``hub:<device>``, ``surface:approval``, ``agent``,
-    ``transfer``). Anything else is treated as an approver id, so an
-    unqualified principal can never be mistaken for the agent in the
-    chain. Refuses empty/oversized/control-bearing values.
+    A RECOGNIZED prefix passes through unchanged: ``approver:<id>``
+    for human decisions (the room path passes its sender explicitly
+    prefixed), plus the declared machine kinds (``hub:<device>``,
+    ``surface:approval``, ``agent``, ``transfer``). Anything else — an
+    UNPREFIXED string — resolves to the NON-human credential class
+    (``hub:<value>``), never to the approver prefix (review V6c: a hub
+    mount configured with a bare device id must not be able to write
+    human-approver provenance into the chain). Refuses empty/oversized/
+    control-bearing values.
     """
     if not isinstance(principal, str) or not principal.strip():
         raise ValueError("principal must be a non-empty string")
@@ -370,7 +410,7 @@ def _principal_label(principal: str) -> str:
         raise ValueError("principal must be one bounded line")
     if text.split(":", 1)[0].lower() in _PRINCIPAL_KINDS:
         return text
-    return f"approver:{text}"
+    return f"hub:{text}"
 
 
 def _refusal_display(action: str, reason: RejectReason) -> str:
@@ -477,6 +517,12 @@ class ApprovalGatewayCore:
         self._event_to_request: dict[str, int] = {}
         self._swept: set[int] = set()
         self._undo_windows: dict[int, tuple[datetime, dict]] = {}
+        #: Reserved surface ids the wall must never broker (review V6f):
+        #: the approvals surface registers its ids here BY DEFAULT at
+        #: build time (``build_approval_surface_app``), so protection is
+        #: not an opt-in step a broker can forget. Brokers' walls
+        #: consult :meth:`is_protected_surface` before granting.
+        self.protected_surfaces: frozenset[str] = frozenset()
         if shared_room and not command_prefix:
             raise ValueError(
                 "gateway shared_room=True requires a command_prefix "
@@ -513,6 +559,20 @@ class ApprovalGatewayCore:
         return self._transport is not None and not getattr(
             self._transport, "IS_PLACEHOLDER", False
         )
+
+    # ------------------------------------------------- protected surfaces
+
+    def is_protected_surface(self, resource: object) -> bool:
+        """True when ``resource`` names a reserved surface id (review
+        V6f): the approval plane must never be a brokerable resource.
+        The candidate is NORMALIZED (query string and trailing slashes
+        stripped) before the exact-id comparison, so a variant path
+        cannot bypass the registered set. Non-string or empty candidates
+        never match (they are refused by the wall's own shape rules).
+        """
+        if not isinstance(resource, str) or not resource.strip():
+            return False
+        return normalize_surface_id(resource) in self.protected_surfaces
 
     # ------------------------------------------------------------ audit
 
@@ -1069,10 +1129,25 @@ class ApprovalGatewayCore:
             one (state 'expired', state_source 'pending_timeout') rather
             than collapsing it into a bare rejection.
           item_count: number of affected items.
-          audit_head: the post-write audit chain head hash (None when
-            the core has no audit log) — a client verifies the decision
-            LANDED in the chain, not merely that the store moved.
+          audit_written: whether the attempt's audit entry landed in
+            the chain (review V6b); False when no chain is configured.
+          audit_head: the post-write audit chain head hash — advertised
+            ONLY when ``audit_written`` is True (None when the core has
+            no audit log or the write failed) — a client verifies the
+            decision LANDED in the chain, not merely that the store
+            moved.
           principal, announced, notified.
+
+        principal: who is deciding — a RECOGNIZED prefix passes through
+        (``approver:<id>`` for humans, ``hub:<device>`` for the approval
+        surface's hub); an UNPREFIXED string resolves to the NON-human
+        credential class (``hub:<value>``), never to the approver prefix
+        (review V6c). Recorded in the audit chain.
+
+        UNDO LIMITATION (review V6h): reject/revoke arm the 15s undo
+        window, but only the ROOM path can consume it (``undo <id>`` in
+        the approval room). There is no API undo verb in this release —
+        an API decision cannot be undone from the API.
 
         Raises ValueError for an invalid action, duration, principal or
         request number (a caller bug, refused before anything is read).
@@ -1082,6 +1157,76 @@ class ApprovalGatewayCore:
         """
         return await self._execute_decision(
             request_number, action, duration, principal, announce=announce
+        )
+
+    async def replayed_decision(
+        self,
+        request_number: int,
+        action: str,
+        principal: str = "approver",
+    ) -> dict:
+        """Idempotent re-answer for a decision attempt the caller already
+        made with the SAME decision tuple (review V1: a replay cache hit
+        re-reads the EFFECTIVE grant state and answers from that, never
+        from a stale cached answer).
+
+        NEVER applies anything and never writes to the store, the
+        transport or the chain: the original attempt's entries are the
+        record. Answers ``applied`` (with the live record's fields —
+        state, expires_at, item_count) when the current effective
+        (state, state_source) is exactly what ``action`` would have
+        produced, so a delivered-twice approve answers applied twice
+        with the same body; anything else answers ``refused`` with the
+        TRUE state and the stale-card refusal marker (unknown_request /
+        already_decided / expired) — fail closed, never a replay of a
+        stale outcome.
+
+        ``audit_written``/``audit_head``: an APPLIED replay advertises
+        the current head whenever a chain is configured (the decision's
+        entry was written before its store transition by construction).
+        A REFUSED replay never advertises a receipt — the original
+        refusal entry's durability cannot be verified from the record,
+        and a receipt that cannot be verified is not advertised (fail
+        closed).
+        """
+        if isinstance(request_number, bool) or not isinstance(request_number, int):
+            raise ValueError(f"request_number must be an integer, got {request_number!r}")
+        if request_number <= 0:
+            raise ValueError(f"request_number must be positive, got {request_number!r}")
+        if action not in DECISION_ACTIONS:
+            raise ValueError(
+                f"unsupported decision action {action!r} (use {', '.join(DECISION_ACTIONS)})"
+            )
+        label = _principal_label(principal)
+        rid = request_number
+        record = self._record_or_none(rid)
+        if record is None:
+            return self._outcome(
+                "refused",
+                rid,
+                action,
+                reason=RejectReason.UNKNOWN_REQUEST.value,
+                refusal=REFUSAL_UNKNOWN_REQUEST,
+                principal=label,
+            )
+        if (record.state, record.state_source) in _REPLAY_OUTCOMES[action]:
+            return self._outcome(
+                "applied",
+                rid,
+                action,
+                record=record,
+                principal=label,
+                audit_written=self._audit is not None,
+            )
+        return self._outcome(
+            "refused",
+            rid,
+            action,
+            record=record,
+            reason=RejectReason.ALREADY_DECIDED.value,
+            refusal=self._refusal_kind(record),
+            principal=label,
+            audit_written=self._audit is not None,
         )
 
     async def _execute_decision(
@@ -1190,6 +1335,7 @@ class ApprovalGatewayCore:
                 principal=label,
                 announce=announce,
                 notified=await self._announce(payload, announce),
+                audit_written=self._audit is not None,
             )
 
         if action == "reject":
@@ -1201,12 +1347,16 @@ class ApprovalGatewayCore:
                 )
             assert record is not None  # reject() only returns True for a live row
             # Non-widening (capability only ever shrinks): audit failure
-            # is surfaced loudly, the decision stands.
+            # is surfaced loudly, the decision stands — and the body
+            # says audit_written=false instead of advertising a receipt
+            # head for an entry that was not written (review V6b).
+            audit_written = self._audit is not None
             try:
                 self._audit_decision_as(
                     rid, "rejected", "rejected_by_approver", label, record.items
                 )
             except LogWriteError as exc:
+                audit_written = False
                 logger.error(
                     "AUDIT: reject decision entry for request #%d failed: %s", rid, exc
                 )
@@ -1227,6 +1377,7 @@ class ApprovalGatewayCore:
                 principal=label,
                 announce=announce,
                 notified=await self._announce(payload, announce),
+                audit_written=audit_written,
             )
 
         # revoke: one verb, two outcomes (active -> revoked,
@@ -1239,12 +1390,15 @@ class ApprovalGatewayCore:
                 rid, action, self._refusal_kind(record), record, label, announce
             )
         assert record is not None  # revoke() only returns True for a live row
-        # Non-widening: audit failure surfaced loudly, revocation stands.
+        # Non-widening: audit failure surfaced loudly, revocation stands —
+        # and the body flags audit_written=false (review V6b).
+        audit_written = self._audit is not None
         try:
             self._audit_decision_as(
                 rid, "revoked", "revoked_by_approver", label, record.items
             )
         except LogWriteError as exc:
+            audit_written = False
             logger.error(
                 "AUDIT: revoke decision entry for request #%d failed: %s", rid, exc
             )
@@ -1267,6 +1421,7 @@ class ApprovalGatewayCore:
             principal=label,
             announce=announce,
             notified=await self._announce(payload, announce),
+            audit_written=audit_written,
         )
 
     @staticmethod
@@ -1317,8 +1472,15 @@ class ApprovalGatewayCore:
         principal: str = "",
         announce: bool = False,
         notified: bool = False,
+        audit_written: bool = False,
     ) -> dict:
-        """Build the structured decision outcome (the surface's wire body)."""
+        """Build the structured decision outcome (the surface's wire body).
+
+        ``audit_written`` (review V6b) states whether the attempt's audit
+        entry actually landed in the chain; the receipt head is
+        advertised ONLY when it did — the body must never claim a chain
+        receipt for an entry that was not written.
+        """
         return {
             "outcome": outcome,
             "request_number": rid,
@@ -1338,7 +1500,8 @@ class ApprovalGatewayCore:
             "refusal": refusal,
             "item_count": len(record.items) if record is not None else 0,
             "principal": principal,
-            "audit_head": self._audit_head(),
+            "audit_written": bool(audit_written),
+            "audit_head": self._audit_head() if audit_written else None,
             "announced": bool(announce),
             "notified": bool(notified),
         }
@@ -1353,7 +1516,15 @@ class ApprovalGatewayCore:
         announce: bool,
     ) -> dict:
         """One refused decision: report it (never silently) and return
-        the structured outcome. Nothing is written to the store."""
+        the structured outcome. Nothing is written to the store.
+
+        EVERY refusal is AUDITED (review V6a): unknown_request /
+        already_decided / expired attempts leave a chain trace with
+        decision='refused' and the refusal marker as the reason, so the
+        chain contains every authority-relevant attempt. An audit-write
+        failure on a refusal is surfaced as ``audit_written: False`` in
+        the body (and no advertised head) — never silently passed.
+        """
         reason = (
             RejectReason.UNKNOWN_REQUEST
             if refusal == REFUSAL_UNKNOWN_REQUEST
@@ -1367,6 +1538,25 @@ class ApprovalGatewayCore:
             refusal,
             record.state if record is not None else "unknown",
         )
+        audit_written = False
+        if self._audit is not None:
+            try:
+                self._audit_entry(
+                    rid,
+                    "refused",
+                    refusal,
+                    principal,
+                    record.items if record is not None else None,
+                )
+                audit_written = True
+            except LogWriteError as exc:
+                logger.error(
+                    "AUDIT: refusal entry for request #%d (%s) failed: %s "
+                    "(surfacing audit_written=false in the outcome body)",
+                    rid,
+                    refusal,
+                    exc,
+                )
         notified = False
         if announce:
             await self._post(
@@ -1383,6 +1573,7 @@ class ApprovalGatewayCore:
             principal=principal,
             announce=announce,
             notified=notified,
+            audit_written=audit_written,
         )
 
     def audit_surface_refusal(
@@ -1390,7 +1581,7 @@ class ApprovalGatewayCore:
         request_number: int | None,
         reason: str,
         principal: str = "surface:approval",
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """Record a refused decision attempt that never reached the store.
 
         The approval surface calls this for a malformed or invalid
@@ -1398,7 +1589,12 @@ class ApprovalGatewayCore:
         ('malformed_body', 'invalid_duration', ...) so a probe leaves a
         chain trace even though nothing was applied. Write failure is
         surfaced and swallowed (the refusal itself stands — nothing was
-        applied either way); returns the chain head after the attempt.
+        applied either way).
+
+        Returns ``(chain_head, audit_written)`` (review V6b): the head
+        is reported ONLY when the entry landed, so a caller never
+        advertises a receipt for an unwritten entry. ``audit_written``
+        is False whenever no chain is configured.
         """
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("audit reason must be a non-empty string")
@@ -1409,8 +1605,10 @@ class ApprovalGatewayCore:
             and request_number > 0
             else 0
         )
+        written = False
         try:
             self._audit_entry(rid, "refused", reason.strip(), _principal_label(principal))
+            written = True
         except LogWriteError as exc:
             logger.error(
                 "AUDIT: surface refusal entry (#%s, reason=%s) failed: %s",
@@ -1418,7 +1616,7 @@ class ApprovalGatewayCore:
                 reason,
                 exc,
             )
-        return self._audit_head()
+        return (self._audit_head() if written else None, written)
 
     # -------------------------------------------------------------- snapshot
 
@@ -1441,9 +1639,25 @@ class ApprovalGatewayCore:
         still holds as pending/active — terminal rows (rejected,
         revoked) are never in the snapshot.
 
+        BOUNDED (review V6e): each slice is capped at
+        ``SNAPSHOT_MAX_ROWS`` rows (kept in store order — oldest first,
+        the most actionable end) and the body carries ``truncated:
+        True`` when any slice hit the cap, so a client never mistakes a
+        truncated slice for the whole backlog. An expired row whose
+        effective expiry is older than ``SNAPSHOT_EXPIRED_WINDOW`` is
+        dropped from ``expired_recent`` entirely, so the slice is
+        bounded by recency instead of growing forever.
+
+        NEUTRALIZED (review V6d): every agent- or remote-influenced
+        field that reaches the body (justification, item backend /
+        account / resource / label / ops) is single-physical-line,
+        control-stripped and markdown-safe — the same render-time
+        discipline as the room card — so a markdown-rendering client
+        cannot inherit card forgery from item fields.
+
         Returns: generated_at, pending_timeout_seconds (the store's
         ACTUAL configured timeout), pending, active, expired_recent,
-        counts.
+        truncated, counts.
         """
         now = self._now()
         timeout = getattr(self._store, "pending_timeout", None)
@@ -1452,12 +1666,24 @@ class ApprovalGatewayCore:
         pending: list[dict] = []
         active: list[dict] = []
         expired_recent: list[dict] = []
+        truncated = False
         for record in self._store.records_in_states(("pending", "active")):
             if record.state == "expired":
+                if self._expired_beyond_window(record, timeout, now):
+                    continue
+                if len(expired_recent) >= SNAPSHOT_MAX_ROWS:
+                    truncated = True
+                    continue
                 expired_recent.append(self._snapshot_expired(record, timeout))
             elif record.state == "pending":
+                if len(pending) >= SNAPSHOT_MAX_ROWS:
+                    truncated = True
+                    continue
                 pending.append(self._snapshot_pending(record, timeout))
             else:
+                if len(active) >= SNAPSHOT_MAX_ROWS:
+                    truncated = True
+                    continue
                 active.append(self._snapshot_active(record))
         return {
             "generated_at": now.isoformat(),
@@ -1465,6 +1691,7 @@ class ApprovalGatewayCore:
             "pending": pending,
             "active": active,
             "expired_recent": expired_recent,
+            "truncated": truncated,
             "counts": {
                 "pending": len(pending),
                 "active": len(active),
@@ -1473,16 +1700,52 @@ class ApprovalGatewayCore:
         }
 
     @staticmethod
-    def _snapshot_items(record: GrantRecord) -> list[dict]:
+    def _expired_beyond_window(
+        record: GrantRecord, timeout: timedelta, now: datetime
+    ) -> bool:
+        """True when an effectively-expired row is older than the
+        ``expired_recent`` recency window (its slice is bounded by
+        recency, never growing forever — review V6e)."""
+        expired_at: datetime | None = None
+        if record.state_source == "pending_timeout":
+            expired_at = record.created_at + timeout
+        elif record.expires_at is not None:
+            expired_at = record.expires_at
+        if expired_at is None:
+            return False  # no computable expiry: stay visible (fail-visible)
+        return now - expired_at > SNAPSHOT_EXPIRED_WINDOW
+
+    @staticmethod
+    def _snap_text(value: object, limit: int) -> object:
+        """One snapshot free-text field, neutralized (review V6d): single
+        physical line, controls collapsed, markdown-neutralized — the
+        room card's own discipline, reused so a markdown-rendering
+        client cannot inherit card forgery. Non-string store values
+        (e.g. a None label) pass through unchanged."""
+        return _safe_text(value, limit) if isinstance(value, str) else value
+
+    @staticmethod
+    def _snap_resource(value: object) -> object:
+        """The item resource in CODE-SPAN-SAFE form (a backtick would
+        otherwise close a client's code span — the room card's
+        ``_code_text`` discipline)."""
+        return _code_text(value, 256) if isinstance(value, str) else value
+
+    @classmethod
+    def _snapshot_items(cls, record: GrantRecord) -> list[dict]:
         """Item identity for the read model: the store's validated fields
-        only (never anything parsed out of the justification)."""
+        only (never anything parsed out of the justification), each
+        NEUTRALIZED the way the room card renders it (review V6d)."""
         return [
             {
-                "backend": item.get("backend"),
-                "account": item.get("account"),
-                "resource": item.get("resource"),
-                "label": item.get("label"),
-                "ops": list(item.get("ops") or []),
+                "backend": cls._snap_text(item.get("backend"), 64),
+                "account": cls._snap_text(item.get("account"), 128),
+                "resource": cls._snap_resource(item.get("resource")),
+                "label": cls._snap_text(item.get("label"), _MAX_LABEL_RENDER),
+                "ops": [
+                    _code_text(op, 64) if isinstance(op, str) else op
+                    for op in (item.get("ops") or [])
+                ],
                 "expires_at": item.get("expires_at"),
             }
             for item in record.items
@@ -1493,7 +1756,9 @@ class ApprovalGatewayCore:
             "request_number": record.request_number,
             "created_at": record.created_at.isoformat(),
             "pending_deadline": (record.created_at + timeout).isoformat(),
-            "justification": record.justification,
+            "justification": self._snap_text(
+                record.justification, _MAX_JUSTIFICATION_RENDER
+            ),
             "items": self._snapshot_items(record),
             "item_count": len(record.items),
             "state": record.state,
@@ -1506,7 +1771,9 @@ class ApprovalGatewayCore:
             "created_at": record.created_at.isoformat(),
             "decided_at": record.decided_at.isoformat() if record.decided_at else None,
             "expires_at": record.expires_at.isoformat() if record.expires_at else None,
-            "justification": record.justification,
+            "justification": self._snap_text(
+                record.justification, _MAX_JUSTIFICATION_RENDER
+            ),
             "items": self._snapshot_items(record),
             "item_count": len(record.items),
             "state": record.state,
@@ -1535,14 +1802,20 @@ class ApprovalGatewayCore:
     ) -> None:
         """Room entry point for approve/reject — a THIN caller of the one
         decision implementation. The room's answer is the posted
-        confirmation, so the structured outcome is discarded here."""
-        await self._execute_decision(rid, action, duration, sender, announce=True)
+        confirmation, so the structured outcome is discarded here. The
+        sender is passed EXPLICITLY approver-prefixed: the principal
+        labeler requires a recognized prefix, and the room's sender IS
+        the human approver (review V6c)."""
+        await self._execute_decision(
+            rid, action, duration, f"approver:{sender}", announce=True
+        )
 
     async def _revoke(self, rid: int, sender: str) -> None:
         """Room entry point for the operator kill switch (works on pending
         AND active grants; effective-expired grants refuse as a no-op).
-        Also a thin caller of the one decision implementation."""
-        await self._execute_decision(rid, "revoke", None, sender, announce=True)
+        Also a thin caller of the one decision implementation; the
+        sender is approver-prefixed like every room decision."""
+        await self._execute_decision(rid, "revoke", None, f"approver:{sender}", announce=True)
 
     async def _revoke_many(self, sender: str) -> None:
         """'revoke all': every effective-ACTIVE grant. Revokes one at a

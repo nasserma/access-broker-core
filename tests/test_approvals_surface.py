@@ -27,6 +27,7 @@ scopes, the store is real (SQLite in tmp_path), the clock is injected.
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -41,8 +42,13 @@ from access_broker_core.approvals import (
     build_approval_surface_app,
     register_protected_surfaces,
 )
-from access_broker_core.audit import GENESIS, AuditLog, verify_chain
-from access_broker_core.gateways.logic import ApprovalGatewayCore, GatewayTransport
+from access_broker_core.audit import GENESIS, AuditLog, LogWriteError, verify_chain
+from access_broker_core.gateways.logic import (
+    SNAPSHOT_MAX_ROWS,
+    ApprovalGatewayCore,
+    GatewayTransport,
+    _principal_label,
+)
 from access_broker_core.grants import GrantStore
 
 APPROVER = "@owner:example.org"
@@ -79,6 +85,21 @@ class FakeTransport(GatewayTransport):
 
     async def add_reaction(self, event_id: str, emoji: str) -> None:
         self.reactions.append((event_id, emoji))
+
+
+class FailingAudit:
+    """Wraps a real chain but refuses every write (the disk-full shape):
+    pins that a failed audit write never silently passes."""
+
+    def __init__(self, real: AuditLog) -> None:
+        self._real = real
+
+    def record(self, *args: object, **kwargs: object) -> object:
+        raise LogWriteError("injected audit write failure")
+
+    @property
+    def head_hash(self) -> str | None:
+        return self._real.head_hash
 
 
 class Env:
@@ -323,10 +344,21 @@ async def test_outcome_carries_post_write_audit_chain_head(audited: Env) -> None
     assert verify_chain(audited.audit_path).ok
 
 
-async def test_refused_outcome_also_reports_the_chain_head(audited: Env) -> None:
+async def test_refused_outcome_reports_the_chain_head_and_audits_the_refusal(
+    audited: Env,
+) -> None:
+    """Re-pinned for the F1 review batch (V6a/V6b): EVERY refusal attempt
+    is audited (decision='refused' + the refusal marker as reason), the
+    body carries audit_written=True and the post-write head — no longer
+    the pre-refusal GENESIS head."""
     outcome = await audited.core.apply_decision(7, "reject", None, announce=False)
     assert outcome["outcome"] == "refused"
-    assert outcome["audit_head"] == audited.audit.head_hash == GENESIS
+    assert outcome["audit_written"] is True
+    assert outcome["audit_head"] == audited.audit.head_hash != GENESIS
+    lines = audited.audit_lines()
+    assert lines[-1]["decision"] == "refused"
+    assert lines[-1]["reason"] == "unknown_request"
+    assert verify_chain(audited.audit_path).ok
 
 
 # --------------------------------------------------------------- snapshot
@@ -642,6 +674,372 @@ async def test_decision_id_is_bounded_to_the_replay_cache(env: Env) -> None:
             body={"request_number": rid, "action": "reject", "decision_id": f"d-{index}"},
         )
     assert len(app._replays) == MAX_REPLAY_ENTRIES  # noqa: SLF001
+
+
+# --------------------------------------------- F1 review batch (V1/V2/V6)
+#
+# The supervisory fix-first round (2026-11-07): replay-tuple binding +
+# TTL, the parse-boundary/internal-error structured paths, audit-every-
+# refusal, audit_written truth, principal-class hardening, snapshot
+# neutralization and bounds, default protected registration and the
+# hard token floor.
+
+
+async def test_cross_request_replay_is_a_conflict_refusal(audited: Env) -> None:
+    """V1: a decision_id binds to its FULL tuple. Reusing the id for a
+    different request (or a different action) is an audited CONFLICT
+    refusal — the wrong outcome is never applied or replayed."""
+    app = audited.app()
+    first = audited.submit()
+    status, payload = await call(
+        app,
+        "POST",
+        "/approval/decision",
+        body={"request_number": first, "action": "approve", "decision_id": "dec-1"},
+    )
+    assert status == 200 and payload["outcome"] == "applied"
+
+    # Same id, DIFFERENT request number: refused, nothing applied.
+    second = audited.submit()
+    status, payload = await call(
+        app,
+        "POST",
+        "/approval/decision",
+        body={"request_number": second, "action": "revoke", "decision_id": "dec-1"},
+    )
+    assert status == 200
+    assert payload["outcome"] == "refused"
+    assert payload["refusal"] == "decision_id_conflict"
+    assert payload["http_hint"] == 409
+    assert audited.store.get_record(second).state == "pending"
+
+    # Same id, same request, DIFFERENT action: the old outcome must not
+    # be replayed onto the live (now active) request.
+    status, payload = await call(
+        app,
+        "POST",
+        "/approval/decision",
+        body={"request_number": first, "action": "revoke", "decision_id": "dec-1"},
+    )
+    assert payload["refusal"] == "decision_id_conflict"
+    assert audited.store.get_record(first).state == "active"
+
+    # Both conflict attempts are in the chain; the original binding still
+    # answers idempotently (a conflict never evicts it).
+    reasons = [line["reason"] for line in audited.audit_lines()]
+    assert reasons.count("decision_id_conflict") == 2
+    status, payload = await call(
+        app,
+        "POST",
+        "/approval/decision",
+        body={"request_number": first, "action": "approve", "decision_id": "dec-1"},
+    )
+    assert payload["outcome"] == "applied" and payload["replayed"] is True
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_replay_binding_expires_with_the_ttl(env: Env) -> None:
+    """V1 TTL arm: an expired binding is decided FRESH — never answered
+    from the stale cache."""
+    env.audit = AuditLog(env.audit_path, env.clock)
+    env.core._audit = env.audit  # noqa: SLF001 - wiring the chain into the fixture core
+    rid = env.submit()
+    app = env.app()
+    body = {"request_number": rid, "action": "approve", "decision_id": "dec-1"}
+    status, first = await call(app, "POST", "/approval/decision", body=body)
+    assert first["outcome"] == "applied"
+    lines_after_first = len(env.audit_lines())
+
+    app._replays["dec-1"]["expires_at"] = time.monotonic() - 1  # noqa: SLF001
+    status, again = await call(app, "POST", "/approval/decision", body=body)
+    assert status == 200
+    assert again.get("replayed") is not True  # decided fresh, not replayed
+    assert again["outcome"] == "refused" and again["refusal"] == "already_decided"
+    assert again["state"] == "active"  # the TRUE state, re-read
+    # the fresh refusal attempt is audited (V6a)
+    assert len(env.audit_lines()) == lines_after_first + 1
+    assert env.audit_lines()[-1]["decision"] == "refused"
+
+
+async def test_refusal_binding_expires_with_the_ttl(audited: Env) -> None:
+    """V1 TTL arm: a CACHED REFUSAL is not pinned forever — inside the
+    TTL it answers idempotently (no new chain entry), past it the
+    attempt runs fresh and is audited again."""
+    app = audited.app()
+    body = {"request_number": 4242, "action": "reject", "decision_id": "dec-x"}
+    status, first = await call(app, "POST", "/approval/decision", body=body)
+    assert first["outcome"] == "refused" and first["refusal"] == "unknown_request"
+    lines_after_first = len(audited.audit_lines())
+
+    status, again = await call(app, "POST", "/approval/decision", body=body)
+    assert again["replayed"] is True and again["refusal"] == "unknown_request"
+    # A refused replay never advertises a receipt (fail-closed: the
+    # original refusal entry's durability cannot be verified from the
+    # record); the FIRST answer carried the receipt.
+    assert again["audit_written"] is False and again["audit_head"] is None
+    assert first["audit_written"] is True
+    assert len(audited.audit_lines()) == lines_after_first  # replay writes nothing
+
+    app._replays["dec-x"]["expires_at"] = time.monotonic() - 1  # noqa: SLF001
+    status, third = await call(app, "POST", "/approval/decision", body=body)
+    assert third.get("replayed") is not True
+    assert third["refusal"] == "unknown_request"
+    assert len(audited.audit_lines()) == lines_after_first + 1
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_depth_bomb_is_a_structured_audited_refusal(audited: Env) -> None:
+    """V2: a ~4KB deeply-nested JSON body raises RecursionError inside
+    json.loads; the explicit parse boundary answers the structured
+    refusal AND writes the chain entry — never a raw 500."""
+    app = audited.app()
+    bomb = b"[" * 2000 + b"]" * 2000
+    assert len(bomb) <= 4096  # inside the body cap: this is a parse-stage fault
+    status, payload = await call(app, "POST", "/approval/decision", raw_body=bomb)
+    assert status == 200
+    assert payload["outcome"] == "refused" and payload["refusal"] == "malformed_body"
+    assert payload["http_hint"] == 400
+    assert audited.store.all_records() == []
+    lines = audited.audit_lines()
+    assert lines[-1]["decision"] == "refused"
+    assert lines[-1]["reason"] == "malformed_body"
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_nonwidening_internal_error_is_a_structured_refusal(
+    audited: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V2: an unexpected fault on a non-widening action (reject/revoke)
+    answers through the STRUCTURED refusal path — audited, HTTP 200,
+    nothing applied."""
+
+    async def boom(*args: object, **kwargs: object) -> dict:
+        raise RuntimeError("store exploded")
+
+    monkeypatch.setattr(audited.core, "apply_decision", boom)
+    app = audited.app()
+    rid = audited.submit()
+    for action in ("reject", "revoke"):
+        status, payload = await call(
+            app, "POST", "/approval/decision", body={"request_number": rid, "action": action}
+        )
+        assert status == 200  # never a raw 500
+        assert payload["outcome"] == "refused"
+        assert payload["refusal"] == "internal_error"
+        assert payload["http_hint"] == 500
+        assert payload["audit_written"] is True
+    assert audited.store.get_record(rid).state == "pending"  # nothing applied
+    assert [line["reason"] for line in audited.audit_lines()].count("internal_error") == 2
+
+
+async def test_widening_internal_error_is_structured_error_not_a_decision(
+    audited: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V2: a fault on the WIDENING path must not masquerade as a
+    decision outcome: a structured ERROR body (ok=false, outcome=error),
+    audited, and the request untouched."""
+
+    async def boom(*args: object, **kwargs: object) -> dict:
+        raise RuntimeError("store exploded")
+
+    monkeypatch.setattr(audited.core, "apply_decision", boom)
+    app = audited.app()
+    rid = audited.submit()
+    status, payload = await call(
+        app, "POST", "/approval/decision", body={"request_number": rid, "action": "approve"}
+    )
+    assert status == 200  # the module contract: always a structured 200 body
+    assert payload == {
+        "ok": False,
+        "outcome": "error",
+        "request_number": rid,
+        "action": "approve",
+        "error": "internal_error",
+        "surface": "approval",
+        "http_hint": 500,
+    }
+    assert audited.store.get_record(rid).state == "pending"  # never activated
+    assert audited.audit_lines()[-1]["decision"] == "refused"
+    assert audited.audit_lines()[-1]["reason"] == "internal_error"
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_every_decision_refusal_kind_is_audited(audited: Env) -> None:
+    """V6a: unknown_request / already_decided / expired attempts each
+    leave a chain trace (decision='refused', reason=<the marker>)."""
+    rid = audited.submit()
+    await audited.core.apply_decision(rid, "approve", None, "hub:d-1", announce=False)
+    outcome = await audited.core.apply_decision(rid, "approve", None, "hub:d-1", announce=False)
+    assert outcome["refusal"] == "already_decided" and outcome["audit_written"] is True
+
+    other = audited.submit()
+    audited.advance(hours=13)  # past the store's 12h pending timeout
+    outcome = await audited.core.apply_decision(other, "reject", None, "hub:d-1", announce=False)
+    assert outcome["refusal"] == "expired" and outcome["audit_written"] is True
+
+    refusals = [line for line in audited.audit_lines() if line["decision"] == "refused"]
+    assert [line["reason"] for line in refusals] == ["already_decided", "expired"]
+    assert all(line["principal"] == "hub:d-1" for line in refusals)
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_refusal_audit_write_failure_surfaces_in_the_body(audited: Env) -> None:
+    """V6a/V6b: a failed audit write on a refusal never silently passes
+    — the body says audit_written=false and advertises NO head."""
+    audited.core._audit = FailingAudit(audited.audit)  # noqa: SLF001 - inject the fault
+    outcome = await audited.core.apply_decision(7, "reject", None, announce=False)
+    assert outcome["outcome"] == "refused" and outcome["refusal"] == "unknown_request"
+    assert outcome["audit_written"] is False
+    assert outcome["audit_head"] is None  # no receipt for an unwritten entry
+
+
+async def test_reject_with_failed_audit_write_stands_and_flags_the_body(
+    audited: Env,
+) -> None:
+    """V6b: a non-widening applied decision with a failed audit write
+    still stands, but the body never claims a receipt."""
+    audited.core._audit = FailingAudit(audited.audit)  # noqa: SLF001 - inject the fault
+    rid = audited.submit()
+    outcome = await audited.core.apply_decision(rid, "reject", None, announce=False)
+    assert outcome["outcome"] == "applied"  # capability only shrank
+    assert outcome["audit_written"] is False and outcome["audit_head"] is None
+    assert audited.store.get_record(rid).state == "rejected"
+
+    other = audited.submit()
+    outcome = await audited.core.apply_decision(other, "revoke", None, announce=False)
+    assert outcome["outcome"] == "applied"
+    assert outcome["audit_written"] is False and outcome["audit_head"] is None
+    assert audited.store.get_record(other).state == "rejected"
+
+
+def test_unprefixed_principal_resolves_to_the_nonhuman_class() -> None:
+    """V6c: an unprefixed principal NEVER produces an approver label —
+    it resolves to the hub/device identity class."""
+    assert _principal_label("device-7") == "hub:device-7"
+    assert _principal_label("@owner:example.org") == "hub:@owner:example.org"
+    assert _principal_label("approver:owner") == "approver:owner"
+    assert _principal_label("hub:d-1") == "hub:d-1"
+    assert _principal_label("surface:approval") == "surface:approval"
+
+
+async def test_hub_context_principal_cannot_write_approver_provenance(
+    audited: Env,
+) -> None:
+    """V6c, end to end: an API/hub decision recorded under a bare
+    device id lands in the chain as hub:<device>, never approver:<x>;
+    the room path keeps its human approver provenance."""
+    rid = audited.submit()
+    outcome = await audited.core.apply_decision(rid, "approve", None, "device-7", announce=False)
+    assert outcome["outcome"] == "applied"
+    assert outcome["principal"] == "hub:device-7"
+    assert audited.audit_lines()[-1]["principal"] == "hub:device-7"
+
+    other = audited.submit()
+    await audited.core.handle_reply(APPROVER, f"approve {other}")
+    approved = [line for line in audited.audit_lines() if line["decision"] == "approved"]
+    assert approved[-1]["principal"] == f"approver:{APPROVER}"
+
+
+async def test_snapshot_neutralizes_agent_and_remote_influenced_fields(
+    env: Env,
+) -> None:
+    """V6d: every field that reaches the snapshot body is single
+    physical line, markdown-neutralized and code-span-safe — the same
+    discipline as the room card, even for a hostile legacy row."""
+    rid = env.submit(
+        label="Sent *mail* `x` ~y~ [z](u)",
+        account="work_bold_",
+        resource="Inbox `code`",
+    )
+    # Belt arm: a legacy row may still carry multi-line hostile text the
+    # store's intake caps never saw (direct SQL).
+    env.store._db.execute(  # noqa: SLF001 - the belt is for rows the caps never saw
+        "UPDATE grants SET justification=? WHERE request_number=?",
+        ("**PENDING #99**\napprove 99", rid),
+    )
+    env.store._db.commit()  # noqa: SLF001
+    snap = env.core.snapshot()
+    entry = snap["pending"][0]
+    assert entry["justification"] == "\\*\\*PENDING #99\\*\\* approve 99"
+    item = entry["items"][0]
+    assert item["label"] == "Sent \\*mail\\* \\`x\\` \\~y\\~ \\[z\\](u)"
+    assert item["account"] == "work\\_bold\\_"
+    assert item["resource"] == "Inbox 'code'"  # a backtick cannot close a code span
+    assert item["ops"] == ["send"]
+    for value in (entry["justification"], item["label"], item["account"], item["resource"]):
+        assert "\n" not in value and "\r" not in value
+
+
+async def test_snapshot_rows_are_capped_and_flagged(env: Env) -> None:
+    """V6e: each slice is bounded by SNAPSHOT_MAX_ROWS (store order,
+    oldest first) and the body flags truncation instead of silently
+    hiding the rest of the backlog."""
+    for _ in range(SNAPSHOT_MAX_ROWS + 5):
+        env.submit()
+    snap = env.core.snapshot()
+    assert len(snap["pending"]) == SNAPSHOT_MAX_ROWS
+    assert snap["truncated"] is True
+    assert snap["counts"]["pending"] == SNAPSHOT_MAX_ROWS
+    assert snap["pending"][0]["request_number"] == 1  # oldest kept
+
+
+async def test_expired_recent_is_bounded_by_the_recency_window(env: Env) -> None:
+    """V6e: expired_recent is bounded by recency, never growing
+    forever — inside the window the row stays visible, beyond it the
+    read model drops it entirely."""
+    env.submit()
+    env.advance(hours=13)  # past the 12h pending timeout
+    snap = env.core.snapshot()
+    assert snap["counts"]["expired_recent"] == 1  # inside SNAPSHOT_EXPIRED_WINDOW
+    assert snap["truncated"] is False
+    env.advance(hours=25)  # the expiry is now beyond the window
+    snap = env.core.snapshot()
+    assert snap["counts"]["expired_recent"] == 0
+    assert snap["counts"]["pending"] == 0
+
+
+def test_protected_registration_is_default_and_queryproof(env: Env) -> None:
+    """V6f: building the surface registers its ids on the core BY
+    DEFAULT (no opt-in step), and matching normalizes the candidate so
+    trailing-slash/query variants cannot bypass the protected set."""
+    app = env.app(mount_prefix="/broker/approval")
+    assert approval_surface_ids("/broker/approval") <= env.core.protected_surfaces
+    assert env.core.is_protected_surface("/broker/approval/decision")
+    assert env.core.is_protected_surface("/broker/approval/decision/")
+    assert env.core.is_protected_surface("/broker/approval/decision?x=1")
+    assert env.core.is_protected_surface("/broker/approval/decision/?x=1")
+    assert env.core.is_protected_surface("/broker/approval")
+    assert not env.core.is_protected_surface("/some/other/room")
+    assert not env.core.is_protected_surface("")
+    assert not env.core.is_protected_surface(None)  # type: ignore[arg-type]
+    # a second build with the same core unions nothing new (idempotent)
+    before = set(env.core.protected_surfaces)
+    env.app(mount_prefix="/broker/approval")
+    assert set(env.core.protected_surfaces) == before
+    # registered ids are canonicalized on the way in, whatever the target
+    surfaces: set[str] = set()
+    register_protected_surfaces(surfaces, ["/x/decision/", "/y?z=1"])
+    assert surfaces == {"/x/decision", "/y"}
+    # and a core-side registration is query/slash-proof through the
+    # core's own matcher
+    register_protected_surfaces(env.core, ["/x/decision/", "/y?z=1"])
+    assert env.core.is_protected_surface("/x/decision?extra=1")
+    assert env.core.is_protected_surface("/y/")
+    assert app.surface_ids == approval_surface_ids("/broker/approval")
+
+
+def test_min_token_length_is_a_hard_floor(env: Env) -> None:
+    """V6g: 32 is a hard floor — a configured value below it REFUSES TO
+    START (it is never clamped or lowered)."""
+    with pytest.raises(ValueError, match="hard floor"):
+        env.app(min_token_length=16)
+    with pytest.raises(ValueError, match="cannot be lowered"):
+        ApprovalSurfaceApp(env.core, TOKEN, min_token_length=8)
+    with pytest.raises(ValueError, match="must be an integer"):
+        env.app(min_token_length=True)
+    env.app(min_token_length=32)  # the floor itself is legal
+    env.app()  # the default builds fine
+    assert MIN_TOKEN_LENGTH == 32
 
 
 # ------------------------------------------------------- protected surfaces
