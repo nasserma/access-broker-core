@@ -18,6 +18,24 @@ What this file pins, contract by contract:
   malformed bodies refused AND audited, idempotent ``decision_id``
   replay, health, and protected-surface registration.
 
+B1-B8 app-protocol closure (0.4.0), pinned here:
+
+- the decision route's REQUIRED app-protocol fields (``issued_at``
+  freshness vs the broker clock, ``expected_state='pending'``, the
+  canonical ``request_digest`` recomputed against the live record,
+  ``device_id``) — each missing/invalid shape refused with a fixed
+  reason, a stale or mismatched digest refused before anything is
+  applied, all audited;
+- the ``/code`` route (B4/D-F): the hub registers a one-time approve
+  code for a PENDING request; the room's typed ``approve <id> <code>``
+  consumes it (single-use, TTL-bounded), reaction-approve is refused;
+- provenance (B1/R6): API decisions stamp device_id /
+  credential_class='approval-device' / channel='android-app' /
+  request_digest into the hash-chained entry; room decisions stamp
+  channel='text-fallback';
+- the snapshot's pending/active rows carry ``request_digest`` + short
+  ``digest_code`` (B5) and the explicit screen-absence marking (B8).
+
 No network, no broker process: the ASGI app is called with hand-built
 scopes, the store is real (SQLite in tmp_path), the clock is injected.
 """
@@ -36,6 +54,7 @@ import pytest
 from access_broker_core import policy as _cp
 from access_broker_core.approvals import (
     APPROVAL_SURFACE_ID,
+    DECISION_FRESHNESS_SECONDS,
     MIN_TOKEN_LENGTH,
     ApprovalSurfaceApp,
     approval_surface_ids,
@@ -44,10 +63,13 @@ from access_broker_core.approvals import (
 )
 from access_broker_core.audit import GENESIS, AuditLog, LogWriteError, verify_chain
 from access_broker_core.gateways.logic import (
+    APPROVE_EMOJI,
     SNAPSHOT_MAX_ROWS,
     ApprovalGatewayCore,
     GatewayTransport,
     _principal_label,
+    digest_code,
+    request_digest,
 )
 from access_broker_core.grants import GrantStore
 
@@ -203,6 +225,40 @@ async def call(
     return status, payload
 
 
+# ------------------------------------------------- decision body helper (B1/B6)
+
+
+def _live_request_digest(env: Env, rid: int) -> str:
+    """The live record's canonical digest — or a well-shaped dummy when
+    the number names no request (the parse gate only checks shape; the
+    recompute-and-refuse happens inside the decision path)."""
+    try:
+        record = env.store.get_record(rid)
+    except LookupError:
+        return "0" * 64
+    return request_digest(rid, record.items)
+
+
+def decision_body(rid: int, action: str, env: Env, **extra: object) -> dict:
+    """A decision body against the CURRENT wire contract (B1/B6): the
+    verb tuple plus the four REQUIRED app-protocol fields — a fresh
+    ``issued_at`` (the freshness gate reads the BROKER's wall clock, not
+    the fixture's injected clock), ``expected_state='pending'``, the
+    live record's canonical ``request_digest`` and a bounded
+    ``device_id``. ``extra`` overrides or extends (decision_id,
+    duration_seconds, ...)."""
+    body: dict = {
+        "request_number": rid,
+        "action": action,
+        "issued_at": datetime.now(UTC).isoformat(),
+        "expected_state": "pending",
+        "request_digest": _live_request_digest(env, rid),
+        "device_id": "pixel-7",
+    }
+    body.update(extra)
+    return body
+
+
 # ------------------------------------------------------- apply_decision arms
 
 
@@ -318,7 +374,10 @@ async def test_announce_false_posts_nothing(env: Env) -> None:
 
 async def test_room_path_is_a_thin_caller_of_the_same_machinery(env: Env) -> None:
     rid = env.submit()
-    await env.core.handle_reply(APPROVER, f"approve {rid}")
+    # D-F: the room's typed approve is gated on the one-time code the
+    # hub registered (B4) — the same decision machinery, one more gate.
+    env.core.register_approval_code(rid, "ABCDEFGH", 300)
+    await env.core.handle_reply(APPROVER, f"approve {rid} ABCDEFGH")
     assert env.store.get_record(rid).state == "active"
     assert any("Approved" in text for text in env.transport.sent)
 
@@ -533,7 +592,7 @@ async def test_http_approve_returns_applied_structured_body(env: Env) -> None:
         app,
         "POST",
         "/approval/decision",
-        body={"request_number": rid, "action": "approve", "duration_seconds": 3600},
+        body=decision_body(rid, "approve", env, duration_seconds=3600),
     )
     assert status == 200  # never a 4xx for a decision answer
     assert payload["outcome"] == "applied"
@@ -552,14 +611,14 @@ async def test_http_refusals_are_success_answers_with_true_state(env: Env) -> No
     await env.core.apply_decision(rid, "approve", None, announce=False)
 
     status, payload = await call(
-        app, "POST", "/approval/decision", body={"request_number": rid, "action": "approve"}
+        app, "POST", "/approval/decision", body=decision_body(rid, "approve", env)
     )
     assert status == 200
     assert payload["outcome"] == "refused" and payload["refusal"] == "already_decided"
     assert payload["state"] == "active" and payload["http_hint"] == 409
 
     status, payload = await call(
-        app, "POST", "/approval/decision", body={"request_number": 4242, "action": "reject"}
+        app, "POST", "/approval/decision", body=decision_body(4242, "reject", env)
     )
     assert status == 200
     assert payload["outcome"] == "refused" and payload["refusal"] == "unknown_request"
@@ -568,7 +627,7 @@ async def test_http_refusals_are_success_answers_with_true_state(env: Env) -> No
     expired = env.submit()
     env.advance(hours=13)
     status, payload = await call(
-        app, "POST", "/approval/decision", body={"request_number": expired, "action": "reject"}
+        app, "POST", "/approval/decision", body=decision_body(expired, "reject", env)
     )
     assert status == 200
     assert payload["refusal"] == "expired" and payload["state"] == "expired"
@@ -579,7 +638,7 @@ async def test_http_refusals_are_success_answers_with_true_state(env: Env) -> No
 async def test_http_revoke_pending_rejects_with_pending_revoke_source(env: Env) -> None:
     rid = env.submit()
     status, payload = await call(
-        env.app(), "POST", "/approval/decision", body={"request_number": rid, "action": "revoke"}
+        env.app(), "POST", "/approval/decision", body=decision_body(rid, "revoke", env)
     )
     assert status == 200 and payload["outcome"] == "applied"
     assert payload["state"] == "rejected" and payload["state_source"] == "pending_revoke"
@@ -647,7 +706,7 @@ async def test_decision_id_replay_is_idempotent(env: Env, tmp_path: Path) -> Non
     env.core._audit = env.audit  # noqa: SLF001 - wiring the chain into the fixture core
     rid = env.submit()
     app = env.app()
-    body = {"request_number": rid, "action": "approve", "decision_id": "dec-1"}
+    body = decision_body(rid, "approve", env, decision_id="dec-1")
     first_status, first = await call(app, "POST", "/approval/decision", body=body)
     lines_after_first = len(env.audit_lines())
     second_status, second = await call(app, "POST", "/approval/decision", body=body)
@@ -671,7 +730,7 @@ async def test_decision_id_is_bounded_to_the_replay_cache(env: Env) -> None:
             app,
             "POST",
             "/approval/decision",
-            body={"request_number": rid, "action": "reject", "decision_id": f"d-{index}"},
+            body=decision_body(rid, "reject", env, decision_id=f"d-{index}"),
         )
     assert len(app._replays) == MAX_REPLAY_ENTRIES  # noqa: SLF001
 
@@ -695,7 +754,7 @@ async def test_cross_request_replay_is_a_conflict_refusal(audited: Env) -> None:
         app,
         "POST",
         "/approval/decision",
-        body={"request_number": first, "action": "approve", "decision_id": "dec-1"},
+        body=decision_body(first, "approve", audited, decision_id="dec-1"),
     )
     assert status == 200 and payload["outcome"] == "applied"
 
@@ -705,7 +764,7 @@ async def test_cross_request_replay_is_a_conflict_refusal(audited: Env) -> None:
         app,
         "POST",
         "/approval/decision",
-        body={"request_number": second, "action": "revoke", "decision_id": "dec-1"},
+        body=decision_body(second, "revoke", audited, decision_id="dec-1"),
     )
     assert status == 200
     assert payload["outcome"] == "refused"
@@ -719,7 +778,7 @@ async def test_cross_request_replay_is_a_conflict_refusal(audited: Env) -> None:
         app,
         "POST",
         "/approval/decision",
-        body={"request_number": first, "action": "revoke", "decision_id": "dec-1"},
+        body=decision_body(first, "revoke", audited, decision_id="dec-1"),
     )
     assert payload["refusal"] == "decision_id_conflict"
     assert audited.store.get_record(first).state == "active"
@@ -732,7 +791,7 @@ async def test_cross_request_replay_is_a_conflict_refusal(audited: Env) -> None:
         app,
         "POST",
         "/approval/decision",
-        body={"request_number": first, "action": "approve", "decision_id": "dec-1"},
+        body=decision_body(first, "approve", audited, decision_id="dec-1"),
     )
     assert payload["outcome"] == "applied" and payload["replayed"] is True
     assert verify_chain(audited.audit_path).ok
@@ -745,7 +804,7 @@ async def test_replay_binding_expires_with_the_ttl(env: Env) -> None:
     env.core._audit = env.audit  # noqa: SLF001 - wiring the chain into the fixture core
     rid = env.submit()
     app = env.app()
-    body = {"request_number": rid, "action": "approve", "decision_id": "dec-1"}
+    body = decision_body(rid, "approve", env, decision_id="dec-1")
     status, first = await call(app, "POST", "/approval/decision", body=body)
     assert first["outcome"] == "applied"
     lines_after_first = len(env.audit_lines())
@@ -766,7 +825,7 @@ async def test_refusal_binding_expires_with_the_ttl(audited: Env) -> None:
     TTL it answers idempotently (no new chain entry), past it the
     attempt runs fresh and is audited again."""
     app = audited.app()
-    body = {"request_number": 4242, "action": "reject", "decision_id": "dec-x"}
+    body = decision_body(4242, "reject", audited, decision_id="dec-x")
     status, first = await call(app, "POST", "/approval/decision", body=body)
     assert first["outcome"] == "refused" and first["refusal"] == "unknown_request"
     lines_after_first = len(audited.audit_lines())
@@ -821,7 +880,10 @@ async def test_nonwidening_internal_error_is_a_structured_refusal(
     rid = audited.submit()
     for action in ("reject", "revoke"):
         status, payload = await call(
-            app, "POST", "/approval/decision", body={"request_number": rid, "action": action}
+            app,
+            "POST",
+            "/approval/decision",
+            body=decision_body(rid, action, audited),
         )
         assert status == 200  # never a raw 500
         assert payload["outcome"] == "refused"
@@ -846,7 +908,7 @@ async def test_widening_internal_error_is_structured_error_not_a_decision(
     app = audited.app()
     rid = audited.submit()
     status, payload = await call(
-        app, "POST", "/approval/decision", body={"request_number": rid, "action": "approve"}
+        app, "POST", "/approval/decision", body=decision_body(rid, "approve", audited)
     )
     assert status == 200  # the module contract: always a structured 200 body
     assert payload == {
@@ -935,7 +997,8 @@ async def test_hub_context_principal_cannot_write_approver_provenance(
     assert audited.audit_lines()[-1]["principal"] == "hub:device-7"
 
     other = audited.submit()
-    await audited.core.handle_reply(APPROVER, f"approve {other}")
+    audited.core.register_approval_code(other, "ABCDEFGH", 300)
+    await audited.core.handle_reply(APPROVER, f"approve {other} ABCDEFGH")
     approved = [line for line in audited.audit_lines() if line["decision"] == "approved"]
     assert approved[-1]["principal"] == f"approver:{APPROVER}"
 
@@ -1052,10 +1115,11 @@ def test_approval_surface_ids_are_route_shaped() -> None:
         "/broker/approval",
         "/broker/approval/snapshot",
         "/broker/approval/decision",
+        "/broker/approval/code",
         "/broker/approval/health",
     } <= ids
     assert approval_surface_ids("") == frozenset(
-        {APPROVAL_SURFACE_ID, "/snapshot", "/decision", "/health"}
+        {APPROVAL_SURFACE_ID, "/snapshot", "/decision", "/code", "/health"}
     )
 
 
@@ -1102,3 +1166,267 @@ def test_register_protected_surfaces_refuses_bad_input() -> None:
 def test_surface_ids_property_matches_helper(env: Env) -> None:
     app = env.app(mount_prefix="/mcp/approval")
     assert app.surface_ids == approval_surface_ids("/mcp/approval")
+
+
+# ------------------------------------------------ B1-B8 app-protocol closure
+#
+# The 0.4.0 wire contract: the decision route's four REQUIRED app-protocol
+# fields (issued_at freshness, expected_state, request_digest, device_id),
+# the broker-side digest recompute, the /code one-time-code registration
+# route (B4/D-F), the android-app vs text-fallback provenance stamps
+# (B1/R6), and the snapshot's digest/code/screen markers (B5/B8).
+
+
+async def test_stale_issued_at_is_refused_before_any_store_read(audited: Env) -> None:
+    """B6/R4: a decision composed outside the freshness window of the
+    broker's clock is refused BEFORE the replay cache and before any
+    store read — audited with the fixed stale marker, nothing applied."""
+    rid = audited.submit()
+    stale = datetime.now(UTC) - timedelta(seconds=DECISION_FRESHNESS_SECONDS + 300)
+    body = decision_body(rid, "approve", audited, issued_at=stale.isoformat())
+    status, payload = await call(audited.app(), "POST", "/approval/decision", body=body)
+    assert status == 200
+    assert payload["outcome"] == "refused" and payload["refusal"] == "stale_issued_at"
+    assert payload["http_hint"] == 409
+    assert audited.store.get_record(rid).state == "pending"  # nothing applied
+    lines = audited.audit_lines()
+    assert lines[-1]["decision"] == "refused"
+    assert lines[-1]["reason"] == "stale_issued_at"
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_issued_at_skew_inside_the_window_is_accepted(audited: Env) -> None:
+    """B6: the window bounds clock skew BOTH ways — a decision issued
+    half a window ago (or ahead) is still the decision it names."""
+    skew = timedelta(seconds=DECISION_FRESHNESS_SECONDS / 2)
+    for issued_at in (
+        datetime.now(UTC) - skew,
+        datetime.now(UTC) + skew,
+    ):
+        rid = audited.submit()
+        body = decision_body(rid, "approve", audited, issued_at=issued_at.isoformat())
+        status, payload = await call(audited.app(), "POST", "/approval/decision", body=body)
+        assert status == 200 and payload["outcome"] == "applied"
+        assert audited.store.get_record(rid).state == "active"
+
+
+@pytest.mark.parametrize(
+    ("drop", "overrides", "reason"),
+    [
+        ("issued_at", {}, "invalid_issued_at"),
+        ("", {"issued_at": "not-a-timestamp"}, "invalid_issued_at"),
+        ("", {"issued_at": "2026-11-08 12:00:00"}, "invalid_issued_at"),  # naive
+        ("expected_state", {}, "invalid_expected_state"),
+        ("", {"expected_state": "active"}, "invalid_expected_state"),
+        ("request_digest", {}, "invalid_request_digest"),
+        ("", {"request_digest": "xyz"}, "invalid_request_digest"),
+        ("", {"request_digest": "A" * 64}, "invalid_request_digest"),  # uppercase hex
+        ("device_id", {}, "invalid_device_id"),
+        ("", {"device_id": "bad id!"}, "invalid_device_id"),
+        ("", {"device_id": "d" * 129}, "invalid_device_id"),
+    ],
+)
+async def test_required_app_protocol_fields_missing_or_invalid(
+    audited: Env, drop: str, overrides: dict, reason: str
+) -> None:
+    """B1/B6: every REQUIRED app-protocol field is validated strictly —
+    absent, malformed or out-of-shape values refuse with a FIXED reason
+    (audited, HTTP 200 body) before anything is applied."""
+    rid = audited.submit()
+    body = decision_body(rid, "approve", audited, **overrides)
+    if drop:
+        body.pop(drop)
+    status, payload = await call(audited.app(), "POST", "/approval/decision", body=body)
+    assert status == 200
+    assert payload["outcome"] == "refused" and payload["refusal"] == reason
+    assert audited.store.get_record(rid).state == "pending"  # nothing applied
+    lines = audited.audit_lines()
+    assert lines[-1]["decision"] == "refused" and lines[-1]["reason"] == reason
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_request_digest_mismatch_is_refused_and_audited(audited: Env) -> None:
+    """B1/R5: the broker RECOMPUTES the declared digest from the live
+    record — a well-shaped but WRONG digest is refused before the store
+    is touched (what the human signed must be what the broker holds)."""
+    rid = audited.submit()
+    body = decision_body(rid, "approve", audited, request_digest="1" * 64)
+    status, payload = await call(audited.app(), "POST", "/approval/decision", body=body)
+    assert status == 200
+    assert payload["outcome"] == "refused"
+    assert payload["refusal"] == "request_digest_mismatch"
+    assert payload["http_hint"] == 409
+    assert audited.store.get_record(rid).state == "pending"
+    lines = audited.audit_lines()
+    assert lines[-1]["decision"] == "refused"
+    assert lines[-1]["reason"] == "request_digest_mismatch"
+    # the refusal entry still carries the route's provenance (B1/R6)
+    assert lines[-1]["channel"] == "android-app"
+    assert lines[-1]["device_id"] == "pixel-7"
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_replay_with_mismatched_digest_is_refused_not_reanswered(audited: Env) -> None:
+    """B1/R5 on the replay path: a retry of an applied decision whose
+    declared digest no longer matches the live record is REFUSED —
+    never re-answered as an idempotent hit (and never re-applied)."""
+    rid = audited.submit()
+    app = audited.app()
+    body = decision_body(rid, "approve", audited, decision_id="dec-1")
+    status, first = await call(app, "POST", "/approval/decision", body=body)
+    assert status == 200 and first["outcome"] == "applied"
+
+    stale = dict(body, request_digest="2" * 64)
+    status, again = await call(app, "POST", "/approval/decision", body=stale)
+    assert status == 200
+    assert again["outcome"] == "refused"
+    assert again["refusal"] == "request_digest_mismatch"
+    # replayed=True marks the ROUTE (served from the replay branch); the
+    # applied outcome is never re-answered onto different bytes.
+    assert again["replayed"] is True
+    assert again["audit_written"] is False  # a refused replay writes nothing
+
+
+async def test_code_route_registers_and_the_room_consumes_it(audited: Env) -> None:
+    """B4/D-F end to end: the HUB registers a one-time code for a PENDING
+    request over the third credential class; the room's typed approve
+    consumes it. The registration is IN the hash-chained audit."""
+    rid = audited.submit()
+    status, payload = await call(
+        audited.app(),
+        "POST",
+        "/approval/code",
+        body={"request_number": rid, "code": "abcdefgh", "ttl_seconds": 300},
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "registered": True,
+        "request_number": rid,
+        "ttl_seconds": 300,
+        "surface": "approval",
+    }
+    lines = audited.audit_lines()
+    assert lines[-1]["decision"] == "submitted"
+    assert lines[-1]["reason"] == "one_time_code_registered"
+    assert lines[-1]["principal"] == "hub:approval-surface"
+    # the room's typed approve consumes the registered code (single use)
+    await audited.core.handle_reply(APPROVER, f"approve {rid} ABCDEFGH")
+    assert audited.store.get_record(rid).state == "active"
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_code_route_refusals_are_structured_and_audited(audited: Env) -> None:
+    """B4: unknown request, non-pending request, bad code shape and
+    out-of-window TTL all refuse with a FIXED reason — audited, and the
+    code is never registered on a refusal."""
+    app = audited.app()
+    rid = audited.submit()
+    decided = audited.submit()
+    await audited.core.apply_decision(decided, "reject", None, announce=False)
+    cases = [
+        ({"request_number": rid, "code": "IO11IO11", "ttl_seconds": 300}, "invalid_code"),
+        ({"request_number": rid, "code": "ABCDEFGH", "ttl_seconds": 30}, "invalid_code_ttl"),
+        ({"request_number": rid, "code": "ABCDEFGH", "ttl_seconds": 901}, "invalid_code_ttl"),
+        ({"request_number": rid, "code": "ABCDEFGH", "ttl_seconds": "300"}, "invalid_code_ttl"),
+        ({"request_number": 999, "code": "ABCDEFGH", "ttl_seconds": 300}, "unknown_request"),
+        (
+            {"request_number": decided, "code": "ABCDEFGH", "ttl_seconds": 300},
+            "code_not_pending",
+        ),
+    ]
+    for body, reason in cases:
+        status, payload = await call(app, "POST", "/approval/code", body=body)
+        assert status == 200
+        assert payload["outcome"] == "refused" and payload["refusal"] == reason
+        assert payload["http_hint"] in (400, 409)
+    refused = [line["reason"] for line in audited.audit_lines() if line["decision"] == "refused"]
+    assert refused == [case[1] for case in cases]
+    assert verify_chain(audited.audit_path).ok
+    # nothing registered: the room's typed approve still hits the gate
+    await audited.core.handle_reply(APPROVER, f"approve {rid} ABCDEFGH")
+    assert audited.store.get_record(rid).state == "pending"
+
+
+async def test_code_route_method_guard_and_malformed_body(env: Env) -> None:
+    """The /code route is POST-only, and a malformed body is a
+    structured, fixed-reason refusal (nothing registered)."""
+    app = env.app()
+    status, payload = await call(app, "GET", "/approval/code")
+    assert status == 405 and payload == {
+        "ok": False,
+        "error": "method_not_allowed",
+        "allow": "POST",
+    }
+    status, payload = await call(app, "POST", "/approval/code", raw_body=b"{")
+    assert status == 200
+    assert payload["outcome"] == "refused" and payload["refusal"] == "malformed_body"
+
+
+async def test_http_decision_stamps_android_app_provenance(audited: Env) -> None:
+    """B1/R6: every audit entry of an API decision answers which device,
+    which credential class, which channel and which digest — stamped by
+    the ROUTE (never client-declared), riding the hash chain."""
+    rid = audited.submit()
+    body = decision_body(rid, "approve", audited)
+    status, payload = await call(audited.app(), "POST", "/approval/decision", body=body)
+    assert status == 200 and payload["outcome"] == "applied"
+    entry = audited.audit_lines()[-1]
+    assert entry["decision"] == "approved"
+    assert entry["device_id"] == "pixel-7"
+    assert entry["credential_class"] == "approval-device"
+    assert entry["channel"] == "android-app"
+    digest = request_digest(rid, audited.store.get_record(rid).items)
+    assert entry["request_digest"] == digest == body["request_digest"]
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_room_and_reaction_decisions_stamp_text_fallback(audited: Env) -> None:
+    """R11: room decisions are stamped channel='text-fallback' with NO
+    device/credential fields — a mixed-provenance history (room next to
+    app-device decisions) stays readable in the chain."""
+    rid = audited.submit()
+    audited.core.register_approval_code(rid, "ABCDEFGH", 300)
+    await audited.core.handle_reply(APPROVER, f"approve {rid} ABCDEFGH")
+    entry = [line for line in audited.audit_lines() if line["decision"] == "approved"][-1]
+    assert entry["channel"] == "text-fallback"
+    assert "device_id" not in entry and "credential_class" not in entry
+
+    # D-F: the approve REACTION is refused visibly, audited, pending stays
+    other = audited.submit()
+    event_id = await audited.core.notify_request(other, "j", [ITEM])
+    await audited.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    assert audited.store.get_record(other).state == "pending"
+    refusal = [line for line in audited.audit_lines() if line["decision"] == "refused"][-1]
+    assert refusal["reason"] == "one_time_code_reaction_cannot_carry_code"
+    assert refusal["channel"] == "text-fallback"
+    assert any(
+        f"Approve #{other} refused" in text for text in audited.transport.sent
+    )
+    assert verify_chain(audited.audit_path).ok
+
+
+async def test_snapshot_carries_digest_code_and_screen_absence(env: Env) -> None:
+    """B5/B8: pending AND active rows carry the canonical request
+    digest plus its short human cross-check code, and the screen verdict
+    is marked EXPLICITLY absent (an absence must never render as a
+    clean pass). The terminal expired slice carries no screen marking."""
+    rid = env.submit()
+    entry = env.core.snapshot()["pending"][0]
+    digest = request_digest(rid, env.store.get_record(rid).items)
+    assert entry["request_digest"] == digest
+    assert entry["digest_code"] == digest_code(digest)
+    assert entry["screen"] is None
+    assert entry["screen_advisory_incomplete"] is True
+
+    await env.core.apply_decision(rid, "approve", None, announce=False)
+    active = env.core.snapshot()["active"][0]
+    assert active["request_digest"] == digest
+    assert active["digest_code"] == digest_code(digest)
+    assert active["screen"] is None and active["screen_advisory_incomplete"] is True
+
+    other = env.submit()
+    env.advance(hours=13)  # past the store's 12h pending timeout
+    expired = env.core.snapshot()["expired_recent"][0]
+    assert expired["request_number"] == other
+    assert "screen" not in expired and "screen_advisory_incomplete" not in expired

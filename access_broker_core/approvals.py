@@ -8,21 +8,57 @@ surface — one mount helper every broker adopts, so the routes, the
 credential class and the refusal semantics are identical everywhere
 instead of re-implemented four times.
 
-Three routes (all behind the same bearer credential):
+Three routes plus the one-time-code registration route (all behind the
+same bearer credential):
 
 - ``GET  <prefix>/snapshot`` — ``ApprovalGatewayCore.snapshot()``: every
   pending request (with its real deadline and the store's configured
   pending timeout), every active grant (with its expiry) and a separate
-  ``expired_recent`` slice. Read-only.
-- ``POST <prefix>/decision`` — a bounded JSON body
-  (``request_number``, ``action``, optional ``duration_seconds``,
-  optional ``decision_id``) applied through
+  ``expired_recent`` slice. Read-only. Pending and active rows carry the
+  canonical ``request_digest`` + short ``digest_code`` (B5) and the
+  explicit ``screen``/``screen_advisory_incomplete`` absence marking
+  (B8).
+- ``POST <prefix>/decision`` — a bounded JSON body applied through
   ``ApprovalGatewayCore.apply_decision(..., announce=False)``. The
   answer is ALWAYS an HTTP-200 structured body: ``applied`` or
   ``refused``. A refusal is an AUTHORITATIVE success answer — it is
   never a 4xx. The body carries ``http_hint`` (409 for
   already-decided/unknown, 410 for expired) so a client can style it,
   and it always carries the TRUE state + state_source.
+
+  The decision body (B1/B6, closed required set beyond the verb tuple):
+  ``request_number``, ``action``, optional ``duration_seconds``, optional
+  ``decision_id``, plus four REQUIRED app-protocol fields —
+
+  * ``issued_at`` — when the caller composed the decision (ISO 8601,
+    timezone-qualified). Refused when older (or further ahead) than
+    ``DECISION_FRESHNESS_SECONDS`` of the broker's clock: a decision
+    composed against stale authorization state is exactly what the
+    expiry/restart-discard rules exist to prevent (R4/B6).
+  * ``expected_state`` — must be the literal ``"pending"``: the caller
+    declares it composed the decision against a pending card. Whether
+    the request is STILL pending remains the store's CAS to answer.
+  * ``request_digest`` — the canonical sha256 request digest (B5) the
+    card carried. The broker RECOMPUTES it from the live record and
+    refuses on mismatch (R5): what the human signed and what the broker
+    holds must be the same bytes.
+  * ``device_id`` — which enrolled device decided (bounded single-line
+    id; recorded in the hash-chained audit entry).
+
+  The route stamps the provenance itself — ``channel='android-app'``
+  and ``credential_class='approval-device'`` are properties of this
+  route (the third credential class), never client-declared — so every
+  API decision's chain entry answers which device, which credential
+  class, which channel and which digest (B1/R6).
+- ``POST <prefix>/code`` — the one-time approval code registration
+  (B4/D-F): the HUB mints a single-use expiring code for a pending
+  request, displays it on the app's card, and registers it here; the
+  ROOM's typed ``approve <id> <code>`` consumes it. Approve by REACTION
+  is refused outright (a reaction cannot carry the code). Body:
+  ``request_number``, ``code`` (8 chars of the no-I/O/0/1 alphabet),
+  ``ttl_seconds`` (60..900). Unknown request, non-pending request, bad
+  shape or out-of-window TTL are all refused with a fixed reason — the
+  code is never registered on a refusal.
 - ``GET  <prefix>/health`` — ok, version, gateway_configured (plus
   broker_id when configured).
 
@@ -96,12 +132,18 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from importlib import metadata
 from typing import Any
 
 from access_broker_core.auth.static import check_static_credential
-from access_broker_core.gateways.logic import DECISION_ACTIONS, normalize_surface_id
+from access_broker_core.gateways.logic import (
+    DECISION_ACTIONS,
+    ONE_TIME_CODE_MAX_TTL_SECONDS,
+    ONE_TIME_CODE_MIN_TTL_SECONDS,
+    ONE_TIME_CODE_RE,
+    normalize_surface_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +177,26 @@ MAX_REPLAY_ENTRIES = 256
 #: re-read from the effective grant state inside the window).
 REPLAY_TTL_SECONDS = 300.0
 
+#: Decision freshness window (B6/R4): a decision body's ``issued_at``
+#: must be within this many seconds of the broker's clock — past OR
+#: future (clock skew is bounded both ways). A decision composed
+#: against authorization state older than this is refused before the
+#: store is touched, replay protection beyond the decision_id cache.
+DECISION_FRESHNESS_SECONDS = 120.0
+
+#: Provenance the decision route stamps itself (B1/R6): the channel and
+#: credential class are properties of this surface — the third credential
+#: class, reached over the app plane — never client-declared values.
+ROUTE_CHANNEL = "android-app"
+ROUTE_CREDENTIAL_CLASS = "approval-device"
+
 _MAX_DECISION_ID_LENGTH = 128
 _MAX_SURFACE_ID_LENGTH = 256
+_MAX_TIMESTAMP_LENGTH = 64
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_DEVICE_ID_SHAPE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_REQUEST_DIGEST_SHAPE = re.compile(r"^[0-9a-f]{64}$")
 
 #: Fixed refusal reasons for bodies that never reach the decision path.
 #: Each one is AUDITED (decision='refused') so a malformed probe leaves a
@@ -153,6 +211,23 @@ REASON_INVALID_REQUEST = "invalid_request"
 #: A decision_id reused for a DIFFERENT decision tuple (review V1): a
 #: conflict, never a replay of the old outcome — nothing is applied.
 REASON_DECISION_ID_CONFLICT = "decision_id_conflict"
+#: B6 (R4): the decision's ``issued_at`` is outside the freshness
+#: window of the broker's clock — composed against stale state.
+REASON_STALE_ISSUED_AT = "stale_issued_at"
+#: B6: ``issued_at`` missing, unparseable or timezone-naive.
+REASON_INVALID_ISSUED_AT = "invalid_issued_at"
+#: B6: ``expected_state`` absent or not the literal "pending".
+REASON_INVALID_EXPECTED_STATE = "invalid_expected_state"
+#: B1 (R5): ``request_digest`` absent or not 64 lowercase hex.
+REASON_INVALID_REQUEST_DIGEST = "invalid_request_digest"
+#: B1 (R6): ``device_id`` absent or not a bounded single-line id.
+REASON_INVALID_DEVICE_ID = "invalid_device_id"
+#: B1 (R5): the declared digest disagrees with the live record.
+REASON_REQUEST_DIGEST_MISMATCH = "request_digest_mismatch"
+#: B4: one-time code registration refusals (fixed reasons, audited).
+REASON_INVALID_CODE = "invalid_code"
+REASON_INVALID_CODE_TTL = "invalid_code_ttl"
+REASON_CODE_NOT_PENDING = "code_not_pending"
 #: The decision path failed unexpectedly (review V2): answered through
 #: the STRUCTURED refusal/error paths (audited, HTTP 200 body), never a
 #: raw 500 without a chain trace.
@@ -184,6 +259,15 @@ _HTTP_HINTS = {
     REASON_INVALID_DECISION_ID: 400,
     REASON_INVALID_REQUEST: 400,
     REASON_DECISION_ID_CONFLICT: 409,
+    REASON_STALE_ISSUED_AT: 409,
+    REASON_INVALID_ISSUED_AT: 400,
+    REASON_INVALID_EXPECTED_STATE: 422,
+    REASON_INVALID_REQUEST_DIGEST: 400,
+    REASON_INVALID_DEVICE_ID: 400,
+    REASON_REQUEST_DIGEST_MISMATCH: 409,
+    REASON_INVALID_CODE: 400,
+    REASON_INVALID_CODE_TTL: 400,
+    REASON_CODE_NOT_PENDING: 409,
     REASON_INTERNAL_ERROR: 500,
 }
 
@@ -218,11 +302,12 @@ def approval_surface_ids(mount_prefix: str = DEFAULT_MOUNT_PREFIX) -> frozenset[
     """
     prefix = _normalize_prefix(mount_prefix)
     ids = {APPROVAL_SURFACE_ID}
+    leaves = ("snapshot", "decision", "code", "health")
     if prefix:
         ids.add(prefix)
-        ids.update(f"{prefix}/{leaf}" for leaf in ("snapshot", "decision", "health"))
+        ids.update(f"{prefix}/{leaf}" for leaf in leaves)
     else:
-        ids.update(f"/{leaf}" for leaf in ("snapshot", "decision", "health"))
+        ids.update(f"/{leaf}" for leaf in leaves)
     return frozenset(ids)
 
 
@@ -305,6 +390,28 @@ def _package_version() -> str:
         return metadata.version("access-broker-core")
     except metadata.PackageNotFoundError:  # pragma: no cover - installed in prod
         return "unknown"
+
+
+def _parse_issued_at(raw: object) -> datetime | None:
+    """Parse the decision body's ``issued_at`` (B6): a bounded string of
+    timezone-qualified ISO 8601. None for anything else — absent,
+    unparseable, oversized or NAIVE timestamps all refuse (fail-closed:
+    the wire speaks UTC; a local-time ambiguity would shift the
+    freshness window)."""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text or len(text) > _MAX_TIMESTAMP_LENGTH or _CONTROL_CHARS.search(text):
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
 
 
 def _bearer_token(scope: Mapping[str, Any]) -> str:
@@ -472,6 +579,11 @@ class ApprovalSurfaceApp:
             if method == "POST":
                 await self._handle_decision(receive, send)
             return
+        if path == "/code":
+            await self._method_guard(send, method, "POST")
+            if method == "POST":
+                await self._handle_code(receive, send)
+            return
         await self._json(send, 404, {"ok": False, "error": "not_found"})
 
     @staticmethod
@@ -513,7 +625,16 @@ class ApprovalSurfaceApp:
         if isinstance(parsed, str):
             await self._refuse(send, None, parsed)
             return
-        request_number, action, duration, decision_id = parsed
+        request_number, action, duration, decision_id, issued_at, request_digest, device_id = (
+            parsed
+        )
+        # B6 (R4) freshness gate: BEFORE the replay cache and before any
+        # store read — a decision composed against authorization state
+        # older than the window is refused no matter what it names.
+        now = datetime.now(UTC)
+        if abs((now - issued_at).total_seconds()) > DECISION_FRESHNESS_SECONDS:
+            await self._refuse(send, request_number, REASON_STALE_ISSUED_AT)
+            return
         # Review V1: the replay binding is the FULL decision tuple, not
         # the id alone — the same decision_id naming a different decision
         # is a conflict, never a replay of the old outcome.
@@ -540,9 +661,15 @@ class ApprovalSurfaceApp:
                     return
                 # Matching tuple: answer from the CURRENT effective grant
                 # state (re-read), never from a stale cached body (V1).
+                # The retry's declared digest is still checked against
+                # the live record (B1/R5): a retry composed against
+                # different bytes is refused, never re-answered.
                 try:
                     outcome = await self._core.replayed_decision(
-                        request_number, action, self._principal
+                        request_number,
+                        action,
+                        self._principal,
+                        declared_digest=request_digest,
                     )
                 except Exception:  # noqa: BLE001 - a replay never applies anything
                     logger.exception(
@@ -567,6 +694,17 @@ class ApprovalSurfaceApp:
                 duration,
                 self._principal,
                 announce=False,
+                # B1/R6: this route's provenance is stamped HERE, from
+                # route-owned facts — the third credential class over
+                # the app plane — plus the caller's device and declared
+                # digest (recomputed and enforced against the live
+                # record inside apply_decision, R5).
+                provenance={
+                    "device_id": device_id,
+                    "credential_class": ROUTE_CREDENTIAL_CLASS,
+                    "channel": ROUTE_CHANNEL,
+                    "request_digest": request_digest,
+                },
             )
         except ValueError:
             # apply_decision validates the same fields; a body that got
@@ -654,14 +792,32 @@ class ApprovalSurfaceApp:
                 return "ok", bytes(chunks)
 
     def _parse_decision(
-        self, raw: bytes
-    ) -> tuple[int, str, timedelta | None, str | None] | str:
+        self,
+        raw: bytes,
+    ) -> (
+        tuple[
+            int,
+            str,
+            timedelta | None,
+            str | None,
+            datetime,
+            str,
+            str,
+        ]
+        | str
+    ):
         """Validate a decision body; returns the fields or a refusal reason.
 
         Bounded, closed-schema: unknown keys are ignored (forward
         compatibility for a hub that adds a hint), but every REQUIRED
         field is validated strictly and a `duration_seconds` of 0 is
         refused (a zero-length grant is not an approval).
+
+        B1/B6 required app-protocol fields: ``issued_at`` (timezone-
+        qualified ISO 8601, freshness-checked by the caller),
+        ``expected_state`` (the literal 'pending'), ``request_digest``
+        (64 lowercase hex — recomputed against the live record by the
+        decision path, R5) and ``device_id`` (bounded single-line id).
         """
         try:
             # Explicit parse boundary (review V2): json.loads raises
@@ -705,7 +861,116 @@ class ApprovalSurfaceApp:
             ):
                 return REASON_INVALID_DECISION_ID
             decision_id = decision_id.strip()
-        return request_number, action.strip().lower(), duration, decision_id
+        # B6: issued_at is REQUIRED and must parse as timezone-qualified
+        # ISO 8601 — a naive timestamp is refused (fail-closed: the wire
+        # speaks UTC; a local-time ambiguity would shift the window).
+        issued_at = _parse_issued_at(body.get("issued_at"))
+        if issued_at is None:
+            return REASON_INVALID_ISSUED_AT
+        # B6: the caller must declare it composed the decision against a
+        # pending card — anything else is a caller bug, refused.
+        if body.get("expected_state") != "pending":
+            return REASON_INVALID_EXPECTED_STATE
+        # B1 (R5): the canonical digest the card carried.
+        request_digest = body.get("request_digest")
+        if not isinstance(request_digest, str) or not _REQUEST_DIGEST_SHAPE.match(
+            request_digest
+        ):
+            return REASON_INVALID_REQUEST_DIGEST
+        # B1 (R6): which enrolled device decided.
+        device_id = body.get("device_id")
+        if not isinstance(device_id, str) or not _DEVICE_ID_SHAPE.match(device_id):
+            return REASON_INVALID_DEVICE_ID
+        return request_number, action.strip().lower(), duration, decision_id, issued_at, (
+            request_digest
+        ), device_id
+
+    async def _handle_code(self, receive: Any, send: Any) -> None:
+        """B4/D-F: the HUB registers a one-time approve code for a PENDING
+        request (the code the app displays and the room's typed approve
+        consumes). Every refusal is AUDITED with a fixed reason and
+        answered as a structured 200 body — the code is never registered
+        on a refusal."""
+        status, raw = await self._read_body(receive)
+        if status == "disconnect":
+            return  # the client went away; nothing to answer
+        if status == "too_large":
+            await self._refuse(send, None, REASON_BODY_TOO_LARGE)
+            return
+        parsed = self._parse_code(raw)
+        if isinstance(parsed, str):
+            await self._refuse(send, None, parsed)
+            return
+        request_number, code, ttl_seconds = parsed
+        register = getattr(self._core, "register_approval_code", None)
+        if register is None:
+            await self._refuse(send, request_number, REASON_INTERNAL_ERROR)
+            return
+        try:
+            register(request_number, code, ttl_seconds)
+        except ValueError as exc:
+            logger.warning(
+                "approval surface: one-time code registration refused (#%s): %s",
+                request_number,
+                exc,
+            )
+            await self._refuse(send, request_number, REASON_INVALID_CODE)
+            return
+        except LookupError as exc:
+            reason = (
+                REASON_CODE_NOT_PENDING if "not pending" in str(exc) else "unknown_request"
+            )
+            await self._refuse(send, request_number, reason)
+            return
+        except Exception:  # noqa: BLE001 - never a raw 500 without a trace
+            logger.exception(
+                "approval surface: one-time code registration failed (#%s)",
+                request_number,
+            )
+            await self._refuse(send, request_number, REASON_INTERNAL_ERROR)
+            return
+        await self._json(
+            send,
+            200,
+            {
+                "ok": True,
+                "registered": True,
+                "request_number": request_number,
+                "ttl_seconds": ttl_seconds,
+                "surface": "approval",
+            },
+        )
+
+    def _parse_code(self, raw: bytes) -> tuple[int, str, int] | str:
+        """Validate a one-time-code registration body: request_number,
+        code (8 chars of the no-I/O/0/1 alphabet, case-insensitive),
+        ttl_seconds bounded to the core's registered-lifetime window."""
+        try:
+            body = json.loads(raw)
+        except (ValueError, RecursionError):
+            return REASON_MALFORMED_BODY
+        if not isinstance(body, dict):
+            return REASON_MALFORMED_BODY
+        request_number = body.get("request_number")
+        if (
+            isinstance(request_number, bool)
+            or not isinstance(request_number, int)
+            or request_number <= 0
+        ):
+            return REASON_INVALID_REQUEST_NUMBER
+        code = body.get("code")
+        if not isinstance(code, str) or not ONE_TIME_CODE_RE.match(code.strip().upper()):
+            return REASON_INVALID_CODE
+        ttl_seconds = body.get("ttl_seconds")
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or not ONE_TIME_CODE_MIN_TTL_SECONDS
+            <= ttl_seconds
+            <= ONE_TIME_CODE_MAX_TTL_SECONDS
+        ):
+            return REASON_INVALID_CODE_TTL
+        return request_number, code.strip().upper(), ttl_seconds
 
     async def _refuse(
         self, send: Any, request_number: int | None, reason: str

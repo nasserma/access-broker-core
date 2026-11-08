@@ -70,10 +70,14 @@ module):
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
+import hashlib
+import json
 import logging
 import re
-from collections.abc import Callable
+import secrets
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta
 from typing import cast
 
@@ -161,6 +165,100 @@ def _code_text(value: object, limit: int = 256) -> str:
     render as markdown)."""
     return _one_line(value, limit).replace("`", "'")
 
+
+def _canonical_item(item: Mapping) -> dict:
+    """One item in its CANONICAL digest form (B5/R5): the exact byte
+    normalisation the snapshot applies (``_snapshot_items``), so a
+    digest computed from the STORE record and one computed from the
+    served SNAPSHOT row are always the same bytes. Store-validated
+    fields only; justification/labels are display fields and never
+    part of the authorization."""
+    backend = item.get("backend")
+    account = item.get("account")
+    resource = item.get("resource")
+    ops = item.get("ops") or []
+    return {
+        "backend": _safe_text(backend, 64) if isinstance(backend, str) else backend,
+        "account": _safe_text(account, 128) if isinstance(account, str) else account,
+        "resource": _code_text(resource, 256) if isinstance(resource, str) else resource,
+        "ops": [
+            _code_text(op, 64) if isinstance(op, str) else op for op in ops
+        ],
+        "expires_at": item.get("expires_at"),
+    }
+
+
+def canonical_request_payload(request_number: int, items: Iterable[Mapping]) -> dict:
+    """The canonical authorization payload (B3/B5, R5): the exact bytes a
+    decision binds to — the request number and every item's backend,
+    account, resource, SORTED op set and item-level expiry. Justification
+    and labels are DISPLAY fields, never part of the authorization, so
+    they are not in the digest. Items are normalized through
+    :func:`_canonical_item` (the snapshot view), so the same record
+    always digests identically on the read path, the room card and the
+    decision verification.
+    """
+    canonical_items: list[dict] = []
+    for item in items:
+        canonical = _canonical_item(item)
+        canonical["ops"] = sorted(canonical["ops"])
+        canonical_items.append(canonical)
+    return {
+        "request_number": int(request_number),
+        "items": canonical_items,
+    }
+
+
+def request_digest(request_number: int, items: Iterable[Mapping]) -> str:
+    """sha256 over :func:`canonical_request_payload` (64 lowercase hex) —
+    THE identity of the authorization being granted. The decision path
+    recomputes it from the stored record and refuses any declared digest
+    that disagrees (R5: what the human read and what the broker holds
+    must be the same bytes)."""
+    payload = canonical_request_payload(request_number, items)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def digest_code(digest_hex: str) -> str:
+    """The short HUMAN cross-check form of a request digest (B5): base32
+    of the first digest bytes, lowercase, no padding — printed on the
+    room card and carried on the app's card so the two channels can be
+    compared by eye (the design note's request-digest code)."""
+    return base64.b32encode(bytes.fromhex(digest_hex)[:5]).decode("ascii").lower().rstrip("=")
+
+#: The app-protocol provenance fields a decision may stamp into the
+#: chain (B1/R6): a CLOSED set — anything else is a caller bug, refused
+#: before the chain writer is touched. Vocabulary/shape gates for each
+#: value live in the audit module (``_check_app_protocol_fields``), the
+#: same fail-closed seam as custody/screen.
+_PROVENANCE_KEYS = frozenset({"device_id", "credential_class", "channel", "request_digest"})
+
+
+def _validated_provenance(provenance: Mapping[str, str] | None) -> dict[str, str]:
+    """Validate an optional provenance mapping (B1/R6) into chain kwargs.
+
+    None (a legacy caller with nothing to declare) is ``{}``; a mapping
+    must carry ONLY the four app-protocol fields as strings. Raises
+    ValueError on anything else — a caller bug must never reach the
+    chain writer with an unknown field it would silently hash or drop.
+    """
+    if provenance is None:
+        return {}
+    if not isinstance(provenance, Mapping):
+        raise ValueError("provenance must be a mapping of optional app-protocol fields")
+    fields: dict[str, str] = {}
+    for key, value in provenance.items():
+        if key not in _PROVENANCE_KEYS:
+            raise ValueError(
+                f"unknown provenance field {key!r} (not one of {sorted(_PROVENANCE_KEYS)})"
+            )
+        if not isinstance(value, str):
+            raise ValueError(f"provenance field {key!r} must be a string")
+        fields[key] = value
+    return fields
+
+
 # Decision verbs -> the reaction emoji that produced them. Built from
 # DECISION_EMOJIS so the confirmation header always shows the control
 # the approver tapped (test-pinned: the render and the pre-placed
@@ -226,25 +324,41 @@ _REJECT_REASON_TEXT = {
 _HELP_TEXT = f"""{ICON_HELP} **How to decide**
 
 **Reactions** — tap on a request message:
-{APPROVE_EMOJI} approve · {REJECT_EMOJI} reject · {REVOKE_EMOJI} revoke · {STATUS_EMOJI} status
+{REJECT_EMOJI} reject · {REVOKE_EMOJI} revoke · {STATUS_EMOJI} status
+(the {APPROVE_EMOJI} reaction is disabled: it cannot carry the one-time code)
 
 **Commands** — type here:
-`approve <id> [expiry]` — e.g. `approve 3`, `approve 3 8h`
+`approve <id> [expiry] <code>` — e.g. `approve 3 ABCDEFGH`, `approve 3 8h ABCDEFGH`
 `reject <id>` · `revoke <id>` · `revoke all` ·
 `undo <id>` (15s after a reject/revoke) · `status`
 
+`<code>` is the ONE-TIME code the approval app shows for the request —
+approve over text is gated on it (the app decides without a code).
 `<required>` `[optional]`. The **#** shown in messages is **not part** of
 the id: type `approve 3`, never `approve #3`. Expiry: `8h`, `30m`, `2d`."""
 
 _REPLY_RE = re.compile(
     r"^(approve|reject|revoke|undo|status)\s*(\d+)?"
-    r"(?:\s+(\d{1,3}[hmd]))?$",
+    r"(?:\s+(\d{1,3}[hmd]))?"
+    r"(?:\s+([A-HJ-NP-Z2-9]{8}))?$",
     re.IGNORECASE,
 )
 _REPLY_TARGET_RE = re.compile(
     r"^revoke\s+(all)$",
     re.IGNORECASE,
 )
+
+#: The one-time approval code shape (D-F): the hub's pairing-code alphabet
+#: (no I/O/0/1 — unambiguous on every phone font), 8 characters. The code
+#: is minted by the HUB, displayed in the app, and consumed by the room's
+#: approve path — binding what the human read (the app's card) to what the
+#: broker holds (the request).
+ONE_TIME_CODE_RE = re.compile(r"^[A-HJ-NP-Z2-9]{8}$")
+#: Bounds on the one-time code's registered lifetime: the hub registers a
+#: TTL with the code; anything outside this window is refused (fail-closed
+#: — an eternal approval code would be a standing bypass of D-F).
+ONE_TIME_CODE_MIN_TTL_SECONDS = 60
+ONE_TIME_CODE_MAX_TTL_SECONDS = 900
 
 _COMMANDS = ("approve", "reject", "revoke", "undo", "status")
 
@@ -287,13 +401,20 @@ def parse_duration(raw: str | None) -> timedelta | None:
     return timedelta(**{_DURATION_UNITS[m.group(2).lower()]: value})
 
 
-def parse_reply(text: str) -> tuple[str, int | None, timedelta | None] | None:  # noqa: PLR0911
-    """Parse a typed command into (action, request_number, duration).
+def parse_reply(text: str) -> tuple[str, int | None, timedelta | None, str | None] | None:  # noqa: PLR0911
+    """Parse a typed command into (action, request_number, duration, code).
 
-    Forms: 'approve 47', 'approve 47 8h', 'reject 47', 'revoke 47',
-    'revoke all', 'undo 47', 'status'. Returns None when unparseable
-    (the caller replies with a teaching message). Unknown-number and
+    Forms: 'approve 47', 'approve 47 8h', 'approve 47 8h Q7RSTUVW',
+    'approve 47 Q7RSTUVW', 'reject 47', 'revoke 47', 'revoke all',
+    'undo 47', 'status'. Returns None when unparseable (the caller
+    replies with a teaching message). Unknown-number and
     already-decided handling is downstream (store semantics), not here.
+
+    The trailing 8-character group is the ONE-TIME approval code (D-F):
+    parsed ONLY as a shape here; whether it is required, valid, fresh or
+    unused is the approve gate's call, so 'approve 47' still parses and
+    the gate refuses it with a teaching message. The code never attaches
+    to reject/revoke/undo/status (the narrowing is approve-only).
     """
     if not isinstance(text, str):
         return None
@@ -301,11 +422,11 @@ def parse_reply(text: str) -> tuple[str, int | None, timedelta | None] | None:  
     m = _REPLY_RE.match(text)
     if not m:
         if _REPLY_TARGET_RE.match(text):
-            return ("revoke_all", None, None)
+            return ("revoke_all", None, None, None)
         return None
     action = m.group(1).lower()
     if action == "status":
-        return ("status", None, None)
+        return ("status", None, None, None)
     number = m.group(2)
     if number is None:
         return None
@@ -313,9 +434,14 @@ def parse_reply(text: str) -> tuple[str, int | None, timedelta | None] | None:  
     if rid <= 0:
         return None
     if action == "undo":
-        return ("undo", rid, None)
+        return ("undo", rid, None, None)
     duration = parse_duration(m.group(3)) if m.group(3) else None
-    return (action, rid, duration)
+    # D-F narrowing: the one-time code attaches to APPROVE only. A code
+    # typed after reject/revoke/undo/status is dropped by the parser —
+    # the narrowing is approve-only and a reject must not grow a gate it
+    # was never meant to have.
+    code = m.group(4).upper() if (m.group(4) and action == "approve") else None
+    return (action, rid, duration, code)
 
 
 #: The verbs ``apply_decision`` accepts (the API's closed verb set; the
@@ -334,6 +460,10 @@ REFUSAL_UNKNOWN_REQUEST = "unknown_request"
 REFUSAL_ALREADY_DECIDED = "already_decided"
 REFUSAL_EXPIRED = "expired"
 REFUSAL_AUDIT_WRITE_FAILED = "audit_write_failed"
+#: The declared request digest does not match the live record (B1/R5):
+#: the decision was composed against different bytes than the broker
+#: holds — refuse, nothing applied, visibly.
+REFUSAL_REQUEST_DIGEST_MISMATCH = "request_digest_mismatch"
 
 #: The effective (state, state_source) pairs each decision verb produces,
 #: consulted by :meth:`replayed_decision` to answer an idempotent replay
@@ -517,6 +647,12 @@ class ApprovalGatewayCore:
         self._event_to_request: dict[str, int] = {}
         self._swept: set[int] = set()
         self._undo_windows: dict[int, tuple[datetime, dict]] = {}
+        #: One-time approval codes (D-F/B4): rid -> (sha256 of the
+        #: normalized code, expiry deadline). In-memory ONLY — correct for
+        #: the same reason the undo windows are: the store's
+        #: restart-discard rule voids every pending request at boot, so a
+        #: code can never outlive the requests it gates.
+        self._approval_codes: dict[int, tuple[str, datetime]] = {}
         #: Reserved surface ids the wall must never broker (review V6f):
         #: the approvals surface registers its ids here BY DEFAULT at
         #: build time (``build_approval_surface_app``), so protection is
@@ -584,12 +720,18 @@ class ApprovalGatewayCore:
         principal: str,
         items: list[dict] | None = None,
         then: Callable[[], object] | None = None,
+        provenance: Mapping[str, str] | None = None,
     ) -> object:
         """Record one lifecycle entry per ITEM in the audit chain.
 
         ``principal`` names who acted: ``agent`` for the submission (the
         agent authored the request — review P27: the old code credited
         the human), ``approver:<sender>`` for every human decision.
+
+        ``provenance`` (B1/R6) carries the app-protocol fields —
+        device_id, credential_class, channel, request_digest — as an
+        optional mapping validated by the audit module's own gates;
+        None means a caller with nothing to declare (legacy lines).
 
         Every item is recorded (review P26): one entry per item, so a
         multi-item approval is reconstructable from the chain instead of
@@ -603,6 +745,7 @@ class ApprovalGatewayCore:
         """
         if self._audit is None:
             return then() if then is not None else None
+        fields = _validated_provenance(provenance)
         rows = [item for item in (items or []) if isinstance(item, dict)]
         if not rows:
             return self._audit.record(
@@ -614,6 +757,7 @@ class ApprovalGatewayCore:
                 reason=reason,
                 principal=principal,
                 then=then,
+                **fields,
             )
         result: object = None
         last = len(rows) - 1
@@ -629,6 +773,7 @@ class ApprovalGatewayCore:
                 backend=item.get("backend"),
                 principal=principal,
                 then=then if index == last else None,
+                **fields,
             )
         return result
 
@@ -640,6 +785,7 @@ class ApprovalGatewayCore:
         principal: str,
         items: list[dict] | None = None,
         then: Callable[[], object] | None = None,
+        provenance: Mapping[str, str] | None = None,
     ) -> object:
         """One decision entry under an explicit principal label.
 
@@ -655,6 +801,7 @@ class ApprovalGatewayCore:
             principal,
             items=items,
             then=then,
+            provenance=provenance,
         )
 
     def _audit_decision(
@@ -666,7 +813,13 @@ class ApprovalGatewayCore:
         items: list[dict] | None = None,
         then: Callable[[], object] | None = None,
     ) -> object:
-        """One APPROVER decision: principal is ``approver:<sender>``."""
+        """One APPROVER decision: principal is ``approver:<sender>``.
+
+        This is the ROOM's helper (typed commands, reactions, undo,
+        revoke-all), so its entries are stamped channel=text-fallback
+        (R11): a mixed-provenance history — room decisions next to
+        app-device decisions — stays readable in the chain.
+        """
         return self._audit_decision_as(
             rid,
             decision,
@@ -674,6 +827,7 @@ class ApprovalGatewayCore:
             f"approver:{sender}",
             items=items,
             then=then,
+            provenance={"channel": "text-fallback"},
         )
 
     def _audit_head(self) -> str | None:
@@ -758,6 +912,12 @@ class ApprovalGatewayCore:
             f" · {count} item{'s' if count != 1 else ''} ·"
             f" {self._expiry_label()} if approved",
         ]
+        # B5 (request-digest code): the room card prints the same short
+        # code the approval app's card carries, so the two channels can
+        # be cross-checked by eye — what the human read in either channel
+        # is the same authorization bytes.
+        code = digest_code(request_digest(number, items))
+        lines.append(f"Request code `{code}` — the approval app shows the same code.")
         lines += [self._item_line(item, i) for i, item in enumerate(items, start=1)]
         lines += [
             f"{JUSTIFICATION_LABEL}: {_safe_text(justification, _MAX_JUSTIFICATION_RENDER)}"
@@ -766,10 +926,12 @@ class ApprovalGatewayCore:
             lines.append(f"{SCREEN_LABEL}: {_safe_text(screen, _MAX_SCREEN_RENDER)}")
         lines += [
             "",
-            f"**Decide** — {APPROVE_EMOJI} `approve {number}`, or"
-            f" {REJECT_EMOJI} `reject {number}`"
-            f" · shorter: `approve {number} 8h`",
-            f"(react below: {APPROVE_EMOJI} {REJECT_EMOJI} {REVOKE_EMOJI} {STATUS_EMOJI})",
+            f"**Decide** — {REJECT_EMOJI} `reject {number}` ·"
+            f" {REVOKE_EMOJI} `revoke {number}` · approve: `approve {number} <code>`",
+            "(the one-time code shows in the approval app;"
+            f" shorter expiry: `approve {number} 8h <code>`)",
+            f"(react below: {REJECT_EMOJI} {REVOKE_EMOJI} {STATUS_EMOJI};"
+            f" the {APPROVE_EMOJI} reaction is disabled — it cannot carry the code)",
         ]
         return "\n".join(lines)
 
@@ -878,7 +1040,12 @@ class ApprovalGatewayCore:
         if rid is None:
             return  # not one of our request messages (or pre-restart)
         if emoji == APPROVE_EMOJI:
-            await self._decide(rid, "approve", None, sender)
+            # D-F (code-gated): a reaction cannot carry the one-time code,
+            # so reaction-approve is DISABLED — the typed form with the
+            # code (or the app) is the only approve. Refused visibly and
+            # audited, never silently (a refusal a human cannot see is a
+            # pending request that looks decided).
+            await self._refuse_approve_code(rid, "reaction_cannot_carry_code", sender)
         elif emoji == REJECT_EMOJI:
             await self._decide(rid, "reject", None, sender)
         elif emoji == REVOKE_EMOJI:
@@ -929,7 +1096,7 @@ class ApprovalGatewayCore:
             else:
                 await self._post(_HELP_TEXT)
             return
-        action, rid, duration = parsed
+        action, rid, duration, code = parsed
         if action == "status":
             await self._post_summary()
         elif action == "revoke_all":
@@ -939,6 +1106,14 @@ class ApprovalGatewayCore:
         elif action == "undo":
             await self._undo(rid, sender)
         elif action == "approve":
+            # D-F (owner decision, code-gated default): approve over text
+            # requires the ONE-TIME code the app displays. The gate runs
+            # BEFORE the decision: a missing/invalid/expired/used code is
+            # refused and audited, the request stays pending.
+            ok, reason = self._consume_approval_code(rid, code)
+            if not ok:
+                await self._refuse_approve_code(rid, reason, sender)
+                return
             await self._decide(rid, "approve", duration, sender)
         elif action == "reject":
             await self._decide(rid, "reject", None, sender)
@@ -1075,6 +1250,139 @@ class ApprovalGatewayCore:
             {"justification": record.justification, "items": record.items},
         )
 
+    # ------------------------------------------------- one-time code gate
+
+    def register_approval_code(
+        self, request_number: int, code: str, ttl_seconds: int
+    ) -> None:
+        """Register a one-time approval code for a PENDING request (B4).
+
+        The HUB calls this through the approval surface (the third
+        credential class) right after it mints the code for a card it is
+        about to display in the app; the ROOM's approve path consumes it
+        (D-F: approve over text is gated behind the app-displayed code).
+        Fail-closed arms: bad code shape, TTL outside the bounded window,
+        unknown request, or a request that is not pending all refuse —
+        and a RE-registration for the same request REPLACES the code
+        (the hub re-minting is the only writer, through the same
+        credentialed route).
+        """
+        if (
+            isinstance(request_number, bool)
+            or not isinstance(request_number, int)
+            or request_number <= 0
+        ):
+            raise ValueError("request_number must be a positive integer")
+        if not isinstance(code, str) or not ONE_TIME_CODE_RE.match(code.strip().upper()):
+            raise ValueError("code must be 8 characters of the one-time code alphabet")
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or not ONE_TIME_CODE_MIN_TTL_SECONDS <= ttl_seconds <= ONE_TIME_CODE_MAX_TTL_SECONDS
+        ):
+            raise ValueError(
+                f"ttl_seconds must be an integer in"
+                f" [{ONE_TIME_CODE_MIN_TTL_SECONDS}, {ONE_TIME_CODE_MAX_TTL_SECONDS}]"
+            )
+        record = self._record_or_none(request_number)
+        if record is None:
+            raise LookupError(f"unknown request #{request_number}")
+        if record.state != "pending":
+            raise LookupError(f"request #{request_number} is not pending ({record.state})")
+        normalized = code.strip().upper()
+        self._approval_codes[request_number] = (
+            hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+            self._now() + timedelta(seconds=ttl_seconds),
+        )
+        if self._audit is not None:
+            try:
+                self._audit_entry(
+                    request_number,
+                    "submitted",
+                    "one_time_code_registered",
+                    "hub:approval-surface",
+                    record.items,
+                )
+            except LogWriteError as exc:
+                # Non-widening registration: the code stands, the chain
+                # trace is loudly missing.
+                logger.error(
+                    "AUDIT: one-time code registration entry for #%d failed: %s",
+                    request_number,
+                    exc,
+                )
+
+    def _consume_approval_code(self, rid: int, code: str | None) -> tuple[bool, str]:
+        """The D-F approve gate. Returns (ok, reason); reasons are for
+        the audit + the human refusal, and NOTHING is consumed on a
+        failure. On success the code is CONSUMED (single-use) even before
+        the decision itself runs — a code that survived a failed approve
+        would be a replayable bypass of the gate."""
+        if code is None:
+            return False, "code_missing"
+        normalized = code.strip().upper()
+        if not ONE_TIME_CODE_RE.match(normalized):
+            return False, "code_malformed"
+        entry = self._approval_codes.get(rid)
+        if entry is None:
+            return False, "code_unknown"
+        code_hash, deadline = entry
+        if self._now() >= deadline:
+            self._approval_codes.pop(rid, None)
+            return False, "code_expired"
+        if not secrets.compare_digest(code_hash, hashlib.sha256(normalized.encode()).hexdigest()):
+            return False, "code_invalid"
+        self._approval_codes.pop(rid, None)  # single-use, success only
+        return True, "ok"
+
+    async def _refuse_approve_code(self, rid: int, reason: str, sender: str) -> None:
+        """Refuse a code-gated approve VISIBLY (D-F): post the teaching
+        refusal and leave an audited chain trace (channel=text-fallback).
+        The request stays pending either way."""
+        teaching = {
+            "code_missing": "approve over text needs the ONE-TIME code the"
+            " approval app displays for this request",
+            "code_malformed": "the one-time code is 8 characters (no I, O, 0, 1)",
+            "code_unknown": "no code is registered for this request — the"
+            " approval app shows it; if the hub is down, wait for it or"
+            " decide from the app",
+            "code_expired": "the one-time code expired — fetch the card"
+            " again and use the fresh code",
+            "code_invalid": "the one-time code does not match this request"
+            " — fetch the card again in the app",
+            "reaction_cannot_carry_code": "the approve reaction cannot"
+            " carry the one-time code (D-F) — type"
+            f" `approve {rid} <code>` (the code shows in the approval app)"
+            " or decide from the app",
+        }.get(reason, "the one-time code was refused")
+        logger.info(
+            "decision: rid=%d action=approve outcome=refused sender=%s refusal=%s",
+            rid,
+            sender,
+            reason,
+        )
+        audit_written = False
+        if self._audit is not None:
+            try:
+                self._audit_entry(
+                    rid,
+                    "refused",
+                    f"one_time_code_{reason}",
+                    f"approver:{sender}",
+                    None,
+                    provenance={"channel": "text-fallback"},
+                )
+                audit_written = True
+            except LogWriteError as exc:
+                logger.error(
+                    "AUDIT: one-time code refusal entry for #%d failed: %s", rid, exc
+                )
+        await self._post(
+            f"{ICON_REFUSED} **Approve #{rid} refused** — {teaching}."
+            f" The request is still pending; `status` shows it."
+            + ("" if audit_written else " (audit entry could NOT be written)")
+        )
+
     # ------------------------------------------------------------- decisions
 
     async def apply_decision(
@@ -1084,6 +1392,7 @@ class ApprovalGatewayCore:
         duration: timedelta | str | None = None,
         principal: str = "approver",
         announce: bool = True,
+        provenance: Mapping[str, str] | None = None,
     ) -> dict:
         """Apply ONE decision and return a STRUCTURED outcome.
 
@@ -1143,20 +1452,35 @@ class ApprovalGatewayCore:
         surface's hub); an UNPREFIXED string resolves to the NON-human
         credential class (``hub:<value>``), never to the approver prefix
         (review V6c). Recorded in the audit chain.
+        provenance (B1/R6): the optional app-protocol fields
+        (device_id, credential_class, channel, request_digest) stamped
+        into every audit entry of this decision. The approval surface
+        stamps device_id/credential_class/channel/request_digest; the
+        room passes channel=text-fallback; a caller passing nothing
+        writes legacy lines. A declared ``request_digest`` is
+        RECOMPUTED from the live record and any mismatch REFUSES the
+        decision before anything is applied (R5: what the human signed
+        and what the broker holds must be the same bytes).
 
         UNDO LIMITATION (review V6h): reject/revoke arm the 15s undo
         window, but only the ROOM path can consume it (``undo <id>`` in
         the approval room). There is no API undo verb in this release —
         an API decision cannot be undone from the API.
 
-        Raises ValueError for an invalid action, duration, principal or
-        request number (a caller bug, refused before anything is read).
+        Raises ValueError for an invalid action, duration, principal,
+        request number or provenance mapping (a caller bug, refused
+        before anything is read).
         A transport failure with ``announce=True`` raises
         :class:`TransportError` exactly as the room path does; the state
         change stands and the audit chain records it.
         """
         return await self._execute_decision(
-            request_number, action, duration, principal, announce=announce
+            request_number,
+            action,
+            duration,
+            principal,
+            announce=announce,
+            provenance=provenance,
         )
 
     async def replayed_decision(
@@ -1164,6 +1488,7 @@ class ApprovalGatewayCore:
         request_number: int,
         action: str,
         principal: str = "approver",
+        declared_digest: str | None = None,
     ) -> dict:
         """Idempotent re-answer for a decision attempt the caller already
         made with the SAME decision tuple (review V1: a replay cache hit
@@ -1188,6 +1513,13 @@ class ApprovalGatewayCore:
         refusal entry's durability cannot be verified from the record,
         and a receipt that cannot be verified is not advertised (fail
         closed).
+
+        ``declared_digest`` (B1/R5): when the caller declares the
+        request digest its decision was composed against, the replay
+        REFUSES with ``request_digest_mismatch`` if it disagrees with
+        the live record — a retry composed against different bytes than
+        the broker holds is exactly the stale-authorization replay R5
+        exists to refuse, never an answerable idempotency hit.
         """
         if isinstance(request_number, bool) or not isinstance(request_number, int):
             raise ValueError(f"request_number must be an integer, got {request_number!r}")
@@ -1208,6 +1540,24 @@ class ApprovalGatewayCore:
                 reason=RejectReason.UNKNOWN_REQUEST.value,
                 refusal=REFUSAL_UNKNOWN_REQUEST,
                 principal=label,
+            )
+        if (
+            declared_digest is not None
+            and declared_digest
+            != request_digest(rid, record.items)
+        ):
+            # No receipt: this replay wrote nothing (the refusal is
+            # answered, never advertised as a chain entry — a receipt
+            # that cannot be verified is not advertised).
+            return self._outcome(
+                "refused",
+                rid,
+                action,
+                record=record,
+                reason=REFUSAL_REQUEST_DIGEST_MISMATCH,
+                refusal=REFUSAL_REQUEST_DIGEST_MISMATCH,
+                principal=label,
+                audit_written=False,
             )
         if (record.state, record.state_source) in _REPLAY_OUTCOMES[action]:
             return self._outcome(
@@ -1237,12 +1587,16 @@ class ApprovalGatewayCore:
         principal: str,
         *,
         announce: bool,
+        provenance: Mapping[str, str] | None = None,
     ) -> dict:
         """The ONE decision implementation (room + approval surface).
 
         ``_decide``/``_revoke`` are thin callers, so the room and the API
         cannot diverge: same audit seam, same CAS, same undo arming, same
-        confirmations.
+        confirmations. ``provenance`` (B1/R6) is validated once and
+        stamped into every audit entry the decision writes; a declared
+        ``request_digest`` is RECOMPUTED from the live record and a
+        mismatch refuses the decision before the store is touched (R5).
         """
         if isinstance(request_number, bool) or not isinstance(request_number, int):
             raise ValueError(f"request_number must be an integer, got {request_number!r}")
@@ -1255,18 +1609,45 @@ class ApprovalGatewayCore:
         override = _normalize_decision_duration(duration)
         label = _principal_label(principal)
         rid = request_number
+        fields = _validated_provenance(provenance)
 
         try:
             current = self._store.get_record(rid)
         except LookupError:
             return await self._refuse_decision(
-                rid, action, REFUSAL_UNKNOWN_REQUEST, None, label, announce
+                rid, action, REFUSAL_UNKNOWN_REQUEST, None, label, announce, provenance=fields
+            )
+
+        # R5 (broker-side recompute, B1): a decision that declares the
+        # digest of the authorization it was composed against must match
+        # the live record's canonical digest — byte-for-byte — or it is
+        # refused BEFORE anything is applied. The store's CAS stays the
+        # arbiter of the transition; this is the binding of what the
+        # human signed to what the broker holds.
+        declared_digest = fields.get("request_digest")
+        if declared_digest is not None and not secrets.compare_digest(
+            declared_digest, request_digest(rid, current.items)
+        ):
+            return await self._refuse_decision(
+                rid,
+                action,
+                REFUSAL_REQUEST_DIGEST_MISMATCH,
+                current,
+                label,
+                announce,
+                provenance=fields,
             )
 
         if action == "approve":
             if current.state != "pending":
                 return await self._refuse_decision(
-                    rid, action, self._refusal_kind(current), current, label, announce
+                    rid,
+                    action,
+                    self._refusal_kind(current),
+                    current,
+                    label,
+                    announce,
+                    provenance=fields,
                 )
 
             def _commit() -> object:
@@ -1282,7 +1663,13 @@ class ApprovalGatewayCore:
             # the safe direction.)
             try:
                 result = self._audit_decision_as(
-                    rid, "approved", "grant_active", label, current.items, then=_commit
+                    rid,
+                    "approved",
+                    "grant_active",
+                    label,
+                    current.items,
+                    then=_commit,
+                    provenance=fields,
                 )
             except LogWriteError as exc:
                 logger.error(
@@ -1312,7 +1699,13 @@ class ApprovalGatewayCore:
             if isinstance(result, RejectReason):
                 record = self._record_or_none(rid)
                 return await self._refuse_decision(
-                    rid, action, self._refusal_kind(record), record, label, announce
+                    rid,
+                    action,
+                    self._refusal_kind(record),
+                    record,
+                    label,
+                    announce,
+                    provenance=fields,
                 )
             record = cast(GrantRecord, result)
             logger.info(
@@ -1343,7 +1736,13 @@ class ApprovalGatewayCore:
             record = self._record_or_none(rid)
             if not applied:
                 return await self._refuse_decision(
-                    rid, action, self._refusal_kind(record), record, label, announce
+                    rid,
+                    action,
+                    self._refusal_kind(record),
+                    record,
+                    label,
+                    announce,
+                    provenance=fields,
                 )
             assert record is not None  # reject() only returns True for a live row
             # Non-widening (capability only ever shrinks): audit failure
@@ -1353,7 +1752,12 @@ class ApprovalGatewayCore:
             audit_written = self._audit is not None
             try:
                 self._audit_decision_as(
-                    rid, "rejected", "rejected_by_approver", label, record.items
+                    rid,
+                    "rejected",
+                    "rejected_by_approver",
+                    label,
+                    record.items,
+                    provenance=fields,
                 )
             except LogWriteError as exc:
                 audit_written = False
@@ -1387,7 +1791,13 @@ class ApprovalGatewayCore:
         record = self._record_or_none(rid)
         if not applied:
             return await self._refuse_decision(
-                rid, action, self._refusal_kind(record), record, label, announce
+                rid,
+                action,
+                self._refusal_kind(record),
+                record,
+                label,
+                announce,
+                provenance=fields,
             )
         assert record is not None  # revoke() only returns True for a live row
         # Non-widening: audit failure surfaced loudly, revocation stands —
@@ -1395,7 +1805,12 @@ class ApprovalGatewayCore:
         audit_written = self._audit is not None
         try:
             self._audit_decision_as(
-                rid, "revoked", "revoked_by_approver", label, record.items
+                rid,
+                "revoked",
+                "revoked_by_approver",
+                label,
+                record.items,
+                provenance=fields,
             )
         except LogWriteError as exc:
             audit_written = False
@@ -1514,6 +1929,7 @@ class ApprovalGatewayCore:
         record: GrantRecord | None,
         principal: str,
         announce: bool,
+        provenance: Mapping[str, str] | None = None,
     ) -> dict:
         """One refused decision: report it (never silently) and return
         the structured outcome. Nothing is written to the store.
@@ -1547,6 +1963,7 @@ class ApprovalGatewayCore:
                     refusal,
                     principal,
                     record.items if record is not None else None,
+                    provenance=provenance,
                 )
                 audit_written = True
             except LogWriteError as exc:
@@ -1752,6 +2169,7 @@ class ApprovalGatewayCore:
         ]
 
     def _snapshot_pending(self, record: GrantRecord, timeout: timedelta) -> dict:
+        digest = request_digest(record.request_number, record.items)
         return {
             "request_number": record.request_number,
             "created_at": record.created_at.isoformat(),
@@ -1763,9 +2181,21 @@ class ApprovalGatewayCore:
             "item_count": len(record.items),
             "state": record.state,
             "state_source": record.state_source,
+            # B5: the canonical digest of the exact authorization (what a
+            # signed decision binds to, R5) plus its short human
+            # cross-check code — the same code the room card prints.
+            "request_digest": digest,
+            "digest_code": digest_code(digest),
+            # B8: the screen verdict is NOT persisted with the request
+            # (the grants table has no screen column; persisting one is
+            # an owner decision). An absent verdict is therefore marked
+            # EXPLICITLY — an absence must never render as a clean pass.
+            "screen": None,
+            "screen_advisory_incomplete": True,
         }
 
     def _snapshot_active(self, record: GrantRecord) -> dict:
+        digest = request_digest(record.request_number, record.items)
         return {
             "request_number": record.request_number,
             "created_at": record.created_at.isoformat(),
@@ -1778,6 +2208,13 @@ class ApprovalGatewayCore:
             "item_count": len(record.items),
             "state": record.state,
             "state_source": record.state_source,
+            # B5: active grants carry the digest too, so an app-side
+            # revoke of a live grant is signed against the same binding.
+            "request_digest": digest,
+            "digest_code": digest_code(digest),
+            # B8: same explicit absence marking as pending rows.
+            "screen": None,
+            "screen_advisory_incomplete": True,
         }
 
     def _snapshot_expired(self, record: GrantRecord, timeout: timedelta) -> dict:
@@ -1805,17 +2242,31 @@ class ApprovalGatewayCore:
         confirmation, so the structured outcome is discarded here. The
         sender is passed EXPLICITLY approver-prefixed: the principal
         labeler requires a recognized prefix, and the room's sender IS
-        the human approver (review V6c)."""
+        the human approver (review V6c). Room decisions are stamped
+        channel=text-fallback (R11)."""
         await self._execute_decision(
-            rid, action, duration, f"approver:{sender}", announce=True
+            rid,
+            action,
+            duration,
+            f"approver:{sender}",
+            announce=True,
+            provenance={"channel": "text-fallback"},
         )
 
     async def _revoke(self, rid: int, sender: str) -> None:
         """Room entry point for the operator kill switch (works on pending
         AND active grants; effective-expired grants refuse as a no-op).
         Also a thin caller of the one decision implementation; the
-        sender is approver-prefixed like every room decision."""
-        await self._execute_decision(rid, "revoke", None, f"approver:{sender}", announce=True)
+        sender is approver-prefixed like every room decision, and the
+        entry is stamped channel=text-fallback (R11)."""
+        await self._execute_decision(
+            rid,
+            "revoke",
+            None,
+            f"approver:{sender}",
+            announce=True,
+            provenance={"channel": "text-fallback"},
+        )
 
     async def _revoke_many(self, sender: str) -> None:
         """'revoke all': every effective-ACTIVE grant. Revokes one at a

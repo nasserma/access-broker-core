@@ -60,6 +60,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -81,6 +82,13 @@ _CHAINED_FIELDS = (
     "principal",
     "custody",
     "screen",
+    # App-protocol fields (approval-client design note, B1/R6): all
+    # OPTIONAL-WHEN-PRESENT, exactly as custody/screen were added, so
+    # every legacy line still verifies.
+    "device_id",
+    "credential_class",
+    "channel",
+    "request_digest",
 )
 
 #: Tier-2 lifecycle event types (goal contract D5): the values written in
@@ -115,6 +123,28 @@ SCREEN_VALUES = frozenset(
     }
 )
 
+#: The recognized channel vocabulary (approval-client design note, R6/R11):
+#: WHERE a human decision came from. ``android-app`` is a decision relayed
+#: by the hub from the paired app device; ``text-fallback`` is a decision
+#: typed (or reacted) in the approval room. Anything else is refused before
+#: write — the chain must never carry a provenance statement outside the
+#: vocabulary (same fail-closed discipline as custody/screen).
+CHANNEL_VALUES = frozenset({"android-app", "text-fallback"})
+
+#: The approval-plane credential class (D-C/R2): the per-device public-key
+#: credential. Fixed vocabulary of one today; a second member (e.g. an mTLS
+#: device cert class) would be an owner decision.
+CREDENTIAL_CLASS_VALUES = frozenset({"approval-device"})
+
+#: Shape of the optional ``device_id`` provenance field (R1): a bounded
+#: single-line identifier, never free text.
+_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+#: The optional ``request_digest`` (B3/B5, R5) is the canonical sha256 of
+#: the exact authorization being granted — always 64 lowercase hex.
+_REQUEST_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 
 def _check_screen_value(screen) -> None:
     """Fail-closed vocabulary gate on the optional screen field (the
@@ -137,6 +167,48 @@ def _check_custody_value(custody) -> None:
         raise ValueError(
             f"refusing to record custody value {custody!r}: not a "
             "recognized custody class (scoped | account_wide | unscopable)"
+        )
+
+
+def _check_app_protocol_fields(
+    device_id=None, credential_class=None, channel=None, request_digest=None
+) -> None:
+    """Fail-closed gates on the optional app-protocol provenance fields
+    (approval-client design note B1/R6): device_id is one bounded line,
+    credential_class and channel are fixed vocabularies, request_digest
+    is 64 lowercase hex. Runs BEFORE the entry is built; a refused value
+    leaves no partial record behind. All four are optional — a legacy
+    caller passing nothing is unaffected, and legacy lines verify."""
+    if device_id is not None and (
+        not isinstance(device_id, str) or not _DEVICE_ID_RE.match(device_id)
+    ):
+        raise ValueError(
+            f"refusing to record device_id {device_id!r}: not a bounded"
+            " single-line device identifier"
+        )
+    if credential_class is not None and (
+        not isinstance(credential_class, str)
+        or credential_class not in CREDENTIAL_CLASS_VALUES
+    ):
+        raise ValueError(
+            f"refusing to record credential_class {credential_class!r}:"
+            " not a recognized approval credential class"
+            " (approval-device)"
+        )
+    if channel is not None and (
+        not isinstance(channel, str) or channel not in CHANNEL_VALUES
+    ):
+        raise ValueError(
+            f"refusing to record channel {channel!r}: not a recognized"
+            " decision channel (android-app | text-fallback)"
+        )
+    if request_digest is not None and (
+        not isinstance(request_digest, str)
+        or not _REQUEST_DIGEST_RE.match(request_digest)
+    ):
+        raise ValueError(
+            f"refusing to record request_digest {request_digest!r}: not"
+            " a canonical sha256 request digest (64 lowercase hex)"
         )
 
 
@@ -271,6 +343,10 @@ class AuditLog:
         principal: str | None = None,
         custody: str | CustodyClass | None = None,
         screen: str | None = None,
+        device_id: str | None = None,
+        credential_class: str | None = None,
+        channel: str | None = None,
+        request_digest: str | None = None,
     ) -> object:
         """Write the audit entry, flush, then run ``then``. Returns whatever
         ``then`` returns, or None when ``then`` is not given.
@@ -310,6 +386,16 @@ class AuditLog:
         (fail-closed: the chain must never carry a screen statement
         outside the recognized vocabulary).
 
+        device_id / credential_class / channel / request_digest carry the
+        app-protocol decision provenance (approval-client design note,
+        B1/R6): WHICH device decided (bounded id), WHICH credential class
+        authorized it ('approval-device' — the per-device public-key
+        class, D-C), WHICH channel it arrived on ('android-app' |
+        'text-fallback', R11), and the canonical request digest binding
+        the decision to the exact authorization (R5). All four are part
+        of the chain hash but optional, so legacy lines still verify;
+        a value outside its shape or vocabulary is refused before write.
+
         Raises LogWriteError when the write fails (callback NOT run).
         Raises ValueError when a field would contain a configured secret
         (also NOT run - and not written).
@@ -317,6 +403,12 @@ class AuditLog:
         self._check_secrets(account, resource, operation, decision, reason)
         _check_custody_value(custody)
         _check_screen_value(screen)
+        _check_app_protocol_fields(
+            device_id=device_id,
+            credential_class=credential_class,
+            channel=channel,
+            request_digest=request_digest,
+        )
 
         entry = {
             "timestamp": self._clock().isoformat(),
@@ -337,6 +429,17 @@ class AuditLog:
             )
         if screen is not None:
             entry["screen"] = screen
+        # App-protocol provenance (B1/R6): optional-when-present, hashed
+        # only when present — the same legacy-compatibility seam as
+        # custody/screen.
+        if device_id is not None:
+            entry["device_id"] = device_id
+        if credential_class is not None:
+            entry["credential_class"] = credential_class
+        if channel is not None:
+            entry["channel"] = channel
+        if request_digest is not None:
+            entry["request_digest"] = request_digest
         line_record = dict(entry)
         line_record["prev_sha256"] = self._prev_sha256
         line_record["sha256"] = hashlib.sha256(_chain_payload(entry).encode()).hexdigest()

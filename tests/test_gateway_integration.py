@@ -8,7 +8,9 @@ drives the S5 grant state machine.
 
 Flow proven per test:
 1. agent submits a pending request (store.submit + core.notify_request)
-2. human approves via core.handle_reaction -> grant becomes active
+2. human approves via typed reply carrying the one-time code
+   (core.handle_reply('approve N <code>') — B4/D-F, 0.4.0: the
+   reaction cannot carry the code, so it is no longer the approve path)
 3. store.active_for authorizes a Tier-2 operation
 4. operator revokes via core.handle_reply('revoke N') -> grant dies
 5. restart semantics: pending discarded, active preserved
@@ -58,6 +60,15 @@ _GW_REGISTRY = _cp.PolicyRegistry(
 )
 
 APPROVER = "@owner:example.org"
+
+#: One-time approve code for the typed-approve call sites (B4/D-F):
+#: registered the way the hub registers it, then typed after the id.
+CODE = "ABCDEFGH"
+
+
+def register_code(core: ApprovalGatewayCore, rid: int, code: str = CODE) -> None:
+    """Register a live one-time approve code for a PENDING request."""
+    core.register_approval_code(rid, code, 300)
 
 ITEM = {
     "backend": "imap",
@@ -251,8 +262,9 @@ async def test_full_tier2_approval_flow(env: Env):
     # not yet authorized: the pending grant authorizes nothing
     assert env.store.active_for("imap", "work", "Sent", "send") == []
 
-    # 2. human approves via reaction on the request message
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    # 2. human approves via the typed reply carrying the one-time code
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
 
     # 3. grant becomes active and authorizes a Tier-2 operation
     assert env.store.get(number) is RequestState.ACTIVE
@@ -289,8 +301,9 @@ async def test_non_approver_reaction_is_ignored(env: Env):
 async def test_restart_discards_pending_keeps_active(env: Env, tmp_path: Path):
     # one request approved, one left pending
     approved = env.submit(justification="keep me")
-    event_id = await env.core.notify_request(approved, "keep me", [ITEM])
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    await env.core.notify_request(approved, "keep me", [ITEM])
+    register_code(env.core, approved)
+    await env.core.handle_reply(APPROVER, f"approve {approved} {CODE}")
     assert env.store.get(approved) is RequestState.ACTIVE
 
     pending = env.submit(justification="stale after restart")
@@ -378,8 +391,9 @@ async def test_f1_submit_decision_audited(env: Env, tmp_path: Path):
 
 async def test_f1_approve_decision_audited_before_confirmation(env: Env, tmp_path: Path):
     number = env.submit()
-    event_id = await env.core.notify_request(number, "j", [ITEM])
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    await env.core.notify_request(number, "j", [ITEM])
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     assert env.store.get(number) is RequestState.ACTIVE
 
     records = _audit_records(tmp_path / "audit.jsonl")
@@ -413,8 +427,9 @@ async def test_f1_reject_decision_audited(env: Env, tmp_path: Path):
 
 async def test_f1_revoke_decision_audited(env: Env, tmp_path: Path):
     number = env.submit()
-    event_id = await env.core.notify_request(number, "j", [ITEM])
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    await env.core.notify_request(number, "j", [ITEM])
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     # after approval the event mapping is cleared (one-time semantics), so
     # revocation goes through the typed command, as in the existing tests
     await env.core.handle_reply(APPROVER, f"revoke {number}")
@@ -428,8 +443,9 @@ async def test_f1_revoke_decision_audited(env: Env, tmp_path: Path):
 
 async def test_f1_revoke_all_audited(env: Env, tmp_path: Path):
     number = env.submit()
-    event_id = await env.core.notify_request(number, "j", [ITEM])
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    await env.core.notify_request(number, "j", [ITEM])
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     await env.core.handle_reply(APPROVER, "revoke all")
     assert env.store.get(number) is RequestState.REVOKED
 
@@ -462,16 +478,14 @@ async def test_f1_approve_fails_closed_on_audit_write_failure(env: Env, tmp_path
     from access_broker_core.audit import LogWriteError
 
     number = env.submit()
-    event_id = await env.core.notify_request(number, "j", [ITEM])
-    assert env.store.get(number) is RequestState.PENDING
-
     original_record = env.audit.record
 
     def broken_record(*args, **kwargs):
         raise LogWriteError("injected disk failure")
 
     env.audit.record = broken_record  # type: ignore[method-assign]
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    register_code(env.core, number)  # non-widening: the code stands, entry loud-missing
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
 
     # the widening transition does NOT survive a failed audit write
     assert env.store.get(number) is RequestState.PENDING
@@ -497,8 +511,9 @@ def test_f1_no_gateway_audit_reference_leaves_no_entries(env: Env, tmp_path: Pat
     number = env.submit()
 
     async def _flow():
-        event_id = await plain_core.notify_request(number, "j", [ITEM])
-        await plain_core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+        await plain_core.notify_request(number, "j", [ITEM])
+        register_code(plain_core, number)
+        await plain_core.handle_reply(APPROVER, f"approve {number} {CODE}")
 
     asyncio.run(_flow())
     assert env.store.get(number) is RequestState.ACTIVE
@@ -566,8 +581,9 @@ async def test_f1_revoke_audit_failure_stands(env: Env, tmp_path: Path):
     from access_broker_core.audit import LogWriteError  # noqa: PLC0415
 
     number = env.submit()
-    event_id = await env.core.notify_request(number, "j", [ITEM])
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    await env.core.notify_request(number, "j", [ITEM])
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     original = env.audit.record
 
     def broken_record(*args, **kwargs):
@@ -586,8 +602,9 @@ async def test_f1_revoke_all_audit_failure_stands(env: Env, tmp_path: Path):
     from access_broker_core.audit import LogWriteError  # noqa: PLC0415
 
     number = env.submit()
-    event_id = await env.core.notify_request(number, "j", [ITEM])
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    await env.core.notify_request(number, "j", [ITEM])
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     original = env.audit.record
 
     def broken_record(*args, **kwargs):
@@ -603,7 +620,8 @@ async def test_f1_reject_refused_branch(env: Env):
     """Branch coverage: rejecting an already-decided number is refused
     (store refuses, no audit entry, no undo window)."""
     number = env.submit()
-    await env.core.handle_reply(APPROVER, f"approve {number}")
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     # second reject on the now-active number -> refused path
     await env.core.handle_reply(APPROVER, f"reject {number}")
     assert env.store.get(number) is RequestState.ACTIVE  # unchanged
@@ -648,8 +666,9 @@ async def test_approve_audit_records_every_item(env: Env, tmp_path: Path):
     """P26: only items[0] used to be recorded; the chain must carry the
     whole authorized payload for a multi-item approval."""
     number = env.submit(items=tuple(MULTI_ITEMS))
-    event_id = await env.core.notify_request(number, "j", MULTI_ITEMS)
-    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    await env.core.notify_request(number, "j", MULTI_ITEMS)
+    register_code(env.core, number)
+    await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     assert env.store.get(number) is RequestState.ACTIVE
 
     approved = [
@@ -668,7 +687,8 @@ async def test_revoke_all_writes_one_addressable_row_per_grant(env: Env, tmp_pat
     second = env.submit(items=({"backend": "caldav", "account": "work", "resource": "Cal", "ops": ["create"]},))
     for rid in (first, second):
         await env.core.notify_request(rid, "j", [ITEM] if rid == first else [])
-        await env.core.handle_reply(APPROVER, f"approve {rid}")
+        register_code(env.core, rid)
+        await env.core.handle_reply(APPROVER, f"approve {rid} {CODE}")
     await env.core.handle_reply(APPROVER, "revoke all")
     assert env.store.get(first) is RequestState.REVOKED
     assert env.store.get(second) is RequestState.REVOKED
@@ -694,7 +714,8 @@ async def test_approve_audit_entry_is_durable_before_the_cas(env: Env, tmp_path:
 
     env.store.approve = spy  # type: ignore[method-assign]
     try:
-        await env.core.handle_reply(APPROVER, f"approve {number}")
+        register_code(env.core, number)
+        await env.core.handle_reply(APPROVER, f"approve {number} {CODE}")
     finally:
         env.store.approve = original
 

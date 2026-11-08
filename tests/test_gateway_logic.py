@@ -45,8 +45,10 @@ from access_broker_core.gateways.logic import (
     STATUS_EMOJI,
     ApprovalGatewayCore,
     GatewayTransport,
+    digest_code,
     parse_duration,
     parse_reply,
+    request_digest,
 )
 from access_broker_core.grants import GrantStore
 from tests import _gw_path  # noqa: E402 - dev-machine sibling resolution
@@ -138,20 +140,41 @@ async def submit_one(store, items=(ITEM,), justification="send the reply"):
     )
 
 
+#: One-time approve code for call sites exercising the typed approve
+#: path (B4/D-F): registered the way the hub registers it, then typed
+#: after the id.
+CODE = "ABCDEFGH"
+
+
+def register_code(core: ApprovalGatewayCore, rid: int, code: str = CODE) -> None:
+    """Register a live one-time approve code for a PENDING request."""
+    core.register_approval_code(rid, code, 300)
+
+
 # ---------------------------------------------------------------------------
 # Pure parsing
 # ---------------------------------------------------------------------------
 
 
 def test_parse_reply_forms():
-    assert parse_reply("approve 47") == ("approve", 47, None)
-    assert parse_reply("approve 47 8h") == ("approve", 47, timedelta(hours=8))
+    assert parse_reply("approve 47") == ("approve", 47, None, None)
+    assert parse_reply("approve 47 8h") == ("approve", 47, timedelta(hours=8), None)
+    # D-F (0.4.0): the trailing 8-char group is the ONE-TIME approve
+    # code — approve-only, uppercased, SHAPE-checked here and gated in
+    # the approve path (missing/wrong/expired/used is the gate's call).
+    assert (
+        parse_reply("approve 47 8h Q7RSTUVW")
+        == ("approve", 47, timedelta(hours=8), "Q7RSTUVW")
+    )
+    assert parse_reply("approve 47 q7rstuvw") == ("approve", 47, None, "Q7RSTUVW")
+    assert parse_reply("reject 47 Q7RSTUVW") == ("reject", 47, None, None)  # approve-only
+    assert parse_reply("approve 47 IO111100") is None  # alphabet excludes I/O/0/1
     assert parse_reply("Approve #47 30m") is None  # '#' is not part of the id
-    assert parse_reply("reject 47") == ("reject", 47, None)
-    assert parse_reply("revoke 47") == ("revoke", 47, None)
-    assert parse_reply("revoke all") == ("revoke_all", None, None)
-    assert parse_reply("undo 47") == ("undo", 47, None)
-    assert parse_reply("status") == ("status", None, None)
+    assert parse_reply("reject 47") == ("reject", 47, None, None)
+    assert parse_reply("revoke 47") == ("revoke", 47, None, None)
+    assert parse_reply("revoke all") == ("revoke_all", None, None, None)
+    assert parse_reply("undo 47") == ("undo", 47, None, None)
+    assert parse_reply("status") == ("status", None, None, None)
     assert parse_reply("approve") is None
     assert parse_reply("approve xx") is None
     assert parse_reply("approve 47 1,2") is None  # no per-item approval in v1
@@ -203,13 +226,34 @@ async def test_post_request_renders_and_preplaces(core_env):
     ]
 
 
-async def test_reaction_approve_grants_and_confirms(core_env):
+async def test_reaction_approve_is_refused_visible_pending_stays(core_env):
+    """D-F (0.4.0): a reaction cannot carry the one-time code, so the
+    approve reaction is DISABLED — refused VISIBLY with teaching text,
+    and the request stays pending (a refusal a human cannot see is a
+    pending request that looks decided)."""
     core, store, transport = make_core()
     number = await submit_one(store)
     event_id = await core.notify_request(number, "j", [ITEM])
     transport.sent.clear()
     await core.handle_reaction("@owner:example.org", event_id, APPROVE_EMOJI)
-    assert store.get(number) is store.get(number)  # sanity: store alive
+    assert store.get(number).value == "pending"
+    refusal = transport.sent[0]
+    assert refusal.startswith(ICON_REFUSED)
+    assert f"**Approve #{number} refused**" in refusal
+    assert "cannot" in refusal  # the teaching says WHY
+    assert "still pending" in refusal
+
+
+async def test_typed_approve_with_code_grants_and_confirms(core_env):
+    """The approve affordance that replaced the reaction (D-F): the
+    typed command carrying the registered one-time code grants and
+    confirms exactly as the reaction path used to."""
+    core, store, transport = make_core()
+    number = await submit_one(store)
+    await core.notify_request(number, "j", [ITEM])
+    transport.sent.clear()
+    register_code(core, number)
+    await core.handle_reply("@owner:example.org", f"approve {number} {CODE}")
     assert store.get(number).value == "active"
     confirm = transport.sent[0]
     assert "Approved #1" in confirm
@@ -312,7 +356,8 @@ async def test_approve_with_duration_override(core_env):
     core, store, transport = make_core()
     await submit_one(store)
     await core.notify_request(1, "j", [ITEM])
-    await core.handle_reply("@owner:example.org", "approve 1 8h")
+    register_code(core, 1)
+    await core.handle_reply("@owner:example.org", f"approve 1 8h {CODE}")
     rec = store.get_record(1)
     assert rec.state == "active"
     assert rec.expires_at is not None
@@ -323,16 +368,28 @@ async def test_double_decision_is_refused_not_crashed(core_env):
     core, store, transport = make_core()
     await submit_one(store)
     await core.notify_request(1, "j", [ITEM])
-    await core.handle_reply("@owner:example.org", "approve 1")
+    register_code(core, 1)
+    await core.handle_reply("@owner:example.org", f"approve 1 {CODE}")
     transport.sent.clear()
+    # the code was consumed (single-use): the second typed approve hits
+    # the D-F gate — refused visibly, never a crash, state unchanged.
     await core.handle_reply("@owner:example.org", "approve 1")
-    assert any("Cannot approve #1" in s for s in transport.sent)
+    assert any("Approve #1 refused" in s for s in transport.sent)
     assert store.get(1).value == "active"
+    # and the decision machinery's own refusal still reads human
+    outcome = await core.apply_decision(1, "approve", announce=True)
+    assert outcome["refusal"] == "already_decided"
+    assert any("Cannot approve #1" in s for s in transport.sent)
 
 
 async def test_unknown_request_number_reported(core_env):
     core, store, transport = make_core()
+    # typed approve without a one-time code: the D-F gate refusal
     await core.handle_reply("@owner:example.org", "approve 99")
+    assert any("Approve #99 refused" in s for s in transport.sent)
+    transport.sent.clear()
+    # the decision machinery's unknown-number refusal (announce path)
+    await core.apply_decision(99, "approve", announce=True)
     assert any("Cannot approve #99" in s for s in transport.sent)
 
 
@@ -342,15 +399,21 @@ async def test_reject_then_approve_is_refused(core_env):
     await core.notify_request(1, "j", [ITEM])
     await core.handle_reply("@owner:example.org", "reject 1")
     transport.sent.clear()
+    # no code can be registered for a decided request, so typed approve
+    # hits the gate; the machinery's own refusal says already-decided.
     await core.handle_reply("@owner:example.org", "approve 1")
+    assert any("Approve #1 refused" in s for s in transport.sent)
+    await core.apply_decision(1, "approve", announce=True)
     assert any("Cannot approve #1" in s for s in transport.sent)
+    assert store.get(1).value == "rejected"
 
 
 async def test_revoke_active_grant_and_undo(core_env):
     core, store, transport = make_core()
     await submit_one(store)
     await core.notify_request(1, "j", [ITEM])
-    await core.handle_reply("@owner:example.org", "approve 1")
+    register_code(core, 1)
+    await core.handle_reply("@owner:example.org", f"approve 1 {CODE}")
     await core.handle_reply("@owner:example.org", "revoke 1")
     assert store.get(1).value == "revoked"
     assert any("Revoked #1" in s for s in transport.sent)
@@ -363,7 +426,8 @@ async def test_revoke_all_posts_summary(core_env):
     core, store, transport = make_core()
     await submit_one(store)
     await core.notify_request(1, "j", [ITEM])
-    await core.handle_reply("@owner:example.org", "approve 1")
+    register_code(core, 1)
+    await core.handle_reply("@owner:example.org", f"approve 1 {CODE}")
     transport.sent.clear()
     await core.handle_reply("@owner:example.org", "revoke all")
     assert store.get(1).value == "revoked"
@@ -391,7 +455,8 @@ async def test_status_shows_active_and_pending_with_aging(core_env):
     core, store, transport = make_core()
     await submit_one(store)
     await core.notify_request(1, "j", [ITEM])
-    await core.handle_reply("@owner:example.org", "approve 1")
+    register_code(core, 1)
+    await core.handle_reply("@owner:example.org", f"approve 1 {CODE}")
     await submit_one(store)
     await core.notify_request(2, "j2", [ITEM])
     transport.sent.clear()
@@ -434,8 +499,10 @@ async def test_full_lifecycle_through_gateway(core_env):
     # Tier-2 operation request arrives (from tools.py in production)
     number = await submit_one(store)
     event_id = await core.notify_request(number, "send the reply", [ITEM])
-    # human approves by reaction with a shorter expiry
-    await core.handle_reaction("@owner:example.org", event_id, APPROVE_EMOJI)
+    assert event_id == "evt-1"
+    # human approves by typed command carrying the one-time code (D-F)
+    register_code(core, number)
+    await core.handle_reply("@owner:example.org", f"approve {number} {CODE}")
     assert store.active_for("imap", "work", "Sent", "send")
     # operator revokes; grant dies
     await core.handle_reply("@owner:example.org", "revoke 1")
@@ -464,7 +531,7 @@ async def test_parser_bug_warning_fired(core_env):
     from unittest import mock
 
     with mock.patch.object(
-        logic_mod, "parse_reply", return_value=("approve", None, None)
+        logic_mod, "parse_reply", return_value=("approve", None, None, None)
     ):
         await core.handle_reply(core._approver, "approve")
     assert not store.all_records()
@@ -735,7 +802,8 @@ async def test_shared_prefixed_command_executes(core_env):
         now=core._now, shared_room=True, command_prefix="comms",
     )
     rid = await submit_one(store)
-    await core.handle_reply("@owner:example.org", "comms approve 1")
+    register_code(core, rid)
+    await core.handle_reply("@owner:example.org", f"comms approve {rid} {CODE}")
     assert store.get_record(rid).state == "active"
 
 
@@ -775,7 +843,8 @@ async def test_shared_outbound_tagged_request(shared_env):
 async def test_shared_prefix_case_insensitive(shared_env):
     core, store, transport = make_shared(shared_env)
     rid = await submit_one(store)
-    await core.handle_reply("@owner:example.org", "Comms approve 1")
+    register_code(core, rid)
+    await core.handle_reply("@owner:example.org", f"Comms approve {rid} {CODE}")
     assert store.get_record(rid).state == "active"
 
 
@@ -844,17 +913,21 @@ def test_message_icons_are_collision_free():
 
 
 def test_request_header_emojis_match_preplaced_controls(core_env):
-    """The four pre-placed reactions are the four controls the render
-    instructs the approver to tap: the instruction line names exactly
-    APPROVE/REJECT and the reaction legend is the DECISION_EMOJIS tuple
-    in order (👍 👎 ⛔ 📋)."""
+    """The reactions the render pre-places are the controls the approver
+    can actually tap: reject/revoke/status (the 👍 reaction is DISABLED
+    — D-F: it cannot carry the one-time code — but is still NAMED so
+    the disablement reads as deliberate), and the Decide line teaches
+    the typed approve WITH the code slot."""
     core, _store, _transport = make_core(core_env)
     text = core.render_request(3, "j", [ITEM])
     legend = [line for line in text.splitlines() if line.startswith("(react")]
-    assert legend, text
-    assert legend[0] == f"(react below: {APPROVE_EMOJI} {REJECT_EMOJI} {REVOKE_EMOJI} {STATUS_EMOJI})"
-    assert f"{APPROVE_EMOJI} `approve 3`" in text and f"{REJECT_EMOJI} `reject 3`" in text
-    # the four controls the approver can tap are named in the render
+    assert legend == [
+        f"(react below: {REJECT_EMOJI} {REVOKE_EMOJI} {STATUS_EMOJI};"
+        f" the {APPROVE_EMOJI} reaction is disabled — it cannot carry the code)"
+    ]
+    assert f"{REJECT_EMOJI} `reject 3`" in text and f"{REVOKE_EMOJI} `revoke 3`" in text
+    assert "`approve 3 <code>`" in text
+    # every control emoji is still named on the card
     for emoji in DECISION_EMOJIS:
         assert emoji in text
     assert tuple(DECISION_EMOJIS) == (APPROVE_EMOJI, REJECT_EMOJI, REVOKE_EMOJI, STATUS_EMOJI)
@@ -1098,7 +1171,7 @@ async def test_undo_window_closed_notice_format(core_env):
 async def test_refusal_and_unknown_command_notices_carry_icons(core_env):
     core, store, transport = make_core(core_env)
     await core.handle_reply("@owner:example.org", "approve 99")
-    refusal = next(t for t in transport.sent if "Cannot approve #99" in t)
+    refusal = next(t for t in transport.sent if "Approve #99 refused" in t)
     assert refusal.startswith(ICON_REFUSED)
     transport.sent.clear()
     await core.handle_reply("@owner:example.org", "aproove 3")
@@ -1133,7 +1206,8 @@ async def test_audit_failure_warning_format(core_env):
     core, store, transport = make_core(core_env)
     core._audit = _BrokenAudit()  # type: ignore[assignment]  # noqa: SLF001
     rid = await submit_one(store)
-    await core.handle_reply("@owner:example.org", f"approve {rid}")
+    register_code(core, rid)
+    await core.handle_reply("@owner:example.org", f"approve {rid} {CODE}")
     warning = transport.sent[-1]
     assert warning.startswith(ICON_WARNING)
     assert "**Approve #1 REFUSED**" in warning
@@ -1165,7 +1239,8 @@ async def test_every_outbound_type_opens_with_an_icon(core_env):
     await core.handle_reply("@owner:example.org", f"reject {rid}")  # rejected
     check(transport.sent[-1])
     rid2 = await submit_one(store)
-    await core.handle_reply("@owner:example.org", f"approve {rid2}")  # approved
+    register_code(core, rid2)
+    await core.handle_reply("@owner:example.org", f"approve {rid2} {CODE}")  # approved
     check(transport.sent[-1])
     await core.handle_reply("@owner:example.org", f"revoke {rid2}")  # revoked
     check(transport.sent[-1])
@@ -1230,16 +1305,22 @@ async def test_shared_room_header_pattern_per_type(shared_env):
 async def test_refusal_display_text_is_human_for_store_reasons(core_env):
     """A refusal must read as a sentence: the store's RejectReason enum
     is translated for display (semantics unchanged — the enum is still
-    what the store returns), while the free-text refusals pass through
-    verbatim."""
+    what the store returns), while the D-F code gate's refusals carry
+    their own human teaching."""
     core, store, transport = make_core(core_env)
+    # the code gate's refusal names the verb and teaches the fix
     await core.handle_reply("@owner:example.org", "approve 99")
+    assert "Approve #99 refused" in transport.sent[-1]
+    assert "ONE-TIME code" in transport.sent[-1]
+    transport.sent.clear()
+    # the decision machinery's refusals stay human (announce path)
+    await core.apply_decision(99, "approve", announce=True)
     assert "Cannot approve #99: no pending request with that number" in transport.sent[-1]
     assert "RejectReason" not in transport.sent[-1]
     transport.sent.clear()
     store.submit("h", [ITEM], "j")
     store.approve(1)
-    await core.handle_reply("@owner:example.org", "approve 1")  # already decided
+    await core.apply_decision(1, "approve", announce=True)  # already decided
     assert "Cannot approve #1: already decided" in transport.sent[-1]
     transport.sent.clear()
     await core.handle_reply("@owner:example.org", "revoke 99")
@@ -1374,7 +1455,7 @@ def test_multiline_justification_cannot_forge_a_card(core_env):
         [ln for ln in lines if ln.startswith(f"{JUSTIFICATION_LABEL}:")]
     ) == 1
     assert text.count("**Decide**") == 1
-    assert text.count("`approve 7`") == 1
+    assert text.count("`approve 7 <code>`") == 1
     # the fabricated instruction lives ONLY inside the justification line
     justification_line = [
         ln for ln in lines if ln.startswith(f"{JUSTIFICATION_LABEL}:")
@@ -1460,3 +1541,112 @@ def test_card_expiry_label_reads_the_store_ttl(core_env):
     assert "24h if approved" in core.render_request(1, "j", [ITEM])
     store._active_ttl = timedelta(hours=6)  # noqa: SLF001 - the configured TTL
     assert "6h if approved" in core.render_request(1, "j", [ITEM])
+
+
+# ------------------------------- one-time approve code (B4/D-F, 0.4.0)
+#
+# The room-side half of the code gate: the hub registers a single-use
+# expiring code for a PENDING request (B4); typed approve is gated on it
+# (D-F); the reaction cannot carry it. The registration's fail-closed
+# arms (shape, TTL window, unknown, non-pending) are pinned here at the
+# core seam — the /code route's HTTP refusals are pinned in
+# test_approvals_surface.py.
+
+
+async def test_typed_approve_without_code_is_refused_visible(core_env):
+    """D-F: approve over text is gated on the one-time code the approval
+    app displays — a missing code is a VISIBLE teaching refusal and the
+    request stays pending."""
+    core, store, transport = make_core(core_env)
+    rid = await submit_one(store)
+    await core.handle_reply("@owner:example.org", f"approve {rid}")
+    assert store.get_record(rid).state == "pending"
+    refusal = transport.sent[-1]
+    assert refusal.startswith(ICON_REFUSED)
+    assert f"**Approve #{rid} refused**" in refusal
+    assert "ONE-TIME code" in refusal
+    assert "still pending" in refusal
+
+
+async def test_one_time_code_is_single_use(core_env):
+    """A consumed code is gone: it cannot approve anything again."""
+    core, store, transport = make_core(core_env)
+    first = await submit_one(store)
+    second = await submit_one(store)
+    register_code(core, first)
+    await core.handle_reply("@owner:example.org", f"approve {first} {CODE}")
+    assert store.get_record(first).state == "active"
+    transport.sent.clear()
+    # the consumed code cannot approve a second request
+    await core.handle_reply("@owner:example.org", f"approve {second} {CODE}")
+    assert store.get_record(second).state == "pending"
+    assert any(f"Approve #{second} refused" in s for s in transport.sent)
+
+
+async def test_one_time_code_wrong_arms_consume_nothing(core_env):
+    """A WRONG code is refused and consumes nothing — the right code
+    still works afterwards (a failed attempt must not burn the gate)."""
+    core, store, transport = make_core(core_env)
+    rid = await submit_one(store)
+    register_code(core, rid, "ZZZZZZZ9")
+    await core.handle_reply("@owner:example.org", f"approve {rid} ABCDEFGH")
+    assert store.get_record(rid).state == "pending"
+    assert any(f"Approve #{rid} refused" in s for s in transport.sent)
+    await core.handle_reply("@owner:example.org", f"approve {rid} ZZZZZZZ9")
+    assert store.get_record(rid).state == "active"
+
+
+async def test_one_time_code_expires_with_its_ttl(core_env):
+    """An expired code is refused with its own teaching — fetch the card
+    again and use the fresh code."""
+    core, store, transport = make_core(core_env)
+    rid = await submit_one(store)
+    register_code(core, rid)
+    core_env.advance(seconds=301)  # past the registered 300s deadline
+    await core.handle_reply("@owner:example.org", f"approve {rid} {CODE}")
+    assert store.get_record(rid).state == "pending"
+    refusal = transport.sent[-1]
+    assert "Approve #1 refused" in refusal
+    assert "expired" in refusal
+
+
+async def test_one_time_code_registration_replaces(core_env):
+    """Re-registration REPLACES the code (the hub re-minting is the
+    only writer, through the same credentialed route)."""
+    core, store, transport = make_core(core_env)
+    rid = await submit_one(store)
+    register_code(core, rid, "ZZZZZZZ9")
+    await core.handle_reply("@owner:example.org", f"approve {rid} ABCDEFGH")
+    assert store.get_record(rid).state == "pending"  # the replaced code is dead
+    await core.handle_reply("@owner:example.org", f"approve {rid} ZZZZZZZ9")
+    assert store.get_record(rid).state == "active"
+
+
+async def test_register_code_fail_closed_arms(core_env):
+    """B4: bad shape, out-of-window TTL, unknown request and a non-pending
+    request all refuse at the core seam — the code is never registered."""
+    core, store, transport = make_core(core_env)
+    rid = await submit_one(store)
+    with pytest.raises(ValueError, match="positive integer"):
+        core.register_approval_code(0, "ABCDEFGH", 300)
+    with pytest.raises(ValueError, match="one-time code alphabet"):
+        core.register_approval_code(rid, "IO111100", 300)
+    with pytest.raises(ValueError, match="integer in"):
+        core.register_approval_code(rid, "ABCDEFGH", 30)
+    with pytest.raises(ValueError, match="integer in"):
+        core.register_approval_code(rid, "ABCDEFGH", 901)
+    with pytest.raises(LookupError, match="unknown request"):
+        core.register_approval_code(999, "ABCDEFGH", 300)
+    await core.apply_decision(rid, "reject", announce=False)
+    with pytest.raises(LookupError, match="not pending"):
+        core.register_approval_code(rid, "ABCDEFGH", 300)
+
+
+def test_request_card_prints_the_digest_code(core_env):
+    """B5: the room card prints the same short request-digest code the
+    approval app's card carries — the two channels cross-check by eye."""
+    core, _store, _t = make_core(core_env)
+    text = core.render_request(3, "j", [ITEM])
+    code = digest_code(request_digest(3, [ITEM]))
+    assert f"Request code `{code}`" in text
+    assert "the approval app shows the same code" in text
