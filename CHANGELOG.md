@@ -7,7 +7,7 @@ Format based on Keep a Changelog; versioning is SemVer.
 
 Hygiene round driven by the full supervisory review
 (`reports/supervisoryReviewFull-2026-11-07.md`); no API removals that
-affect a released broker, but three behavior changes are listed first.
+affect a released broker, but eight behavior changes are listed first.
 
 ### Changed (behavior)
 
@@ -121,6 +121,74 @@ affect a released broker, but three behavior changes are listed first.
   approval plane. No agent-facing tool is added.
 - `GrantStore.active_ttl` so the card's expiry label reads the
   configured TTL instead of a hardcoded constant (P39).
+
+### Fixed (F1 review batch, 2026-11-07)
+
+Fix-first round from the supervisory review of the approvals surface
+(`reports/supervisoryReviewGoal1-2026-11-07.md`, items V1/V2/V6; the
+surface is unreleased, so these land inside the same 0.3.0 section).
+
+- **`approvals`: decision replay is tuple-bound with a TTL (V1, high).**
+  A client `decision_id` binds to the FULL decision tuple
+  (request_number, action, duration) for `REPLAY_TTL_SECONDS` (300s;
+  refusal bindings included). Reusing the id for a different decision
+  is an audited `decision_id_conflict` refusal — the old outcome is
+  never replayed and nothing is applied — and a matching retry answers
+  from the CURRENT effective grant state through the new
+  `ApprovalGatewayCore.replayed_decision` (applied only when the live
+  (state, state_source) is exactly what that verb produces, else
+  refused with the true state), never from a cached outcome body.
+  After the TTL the id is decided fresh, so a mistyped id can no longer
+  pin a stale answer.
+- **`approvals`: explicit parse boundary, structured internal faults
+  (V2, high).** `json.loads` RecursionError (a ~4KB deeply-nested
+  depth bomb) is caught at the parse boundary and answers the
+  structured, audited `malformed_body` refusal — never a raw 500 with
+  no chain trace. An unexpected fault on a NON-widening action
+  (reject/revoke) answers through the structured refusal path
+  (`internal_error`, audited); on the WIDENING path (approve) it
+  answers a structured ERROR body (`ok=false`, `outcome=error`,
+  HTTP 200, audited) that never masquerades as a decision outcome.
+- **`gateways`: every decision refusal is audited (V6a).** Unknown /
+  already-decided / expired attempts each write a chain entry
+  (`decision='refused'`, `reason=<the refusal marker>`, the acting
+  principal), so the chain now contains every authority-relevant
+  attempt; a failed refusal audit write surfaces as
+  `audit_written=false` in the outcome body instead of silently
+  passing.
+- **Outcome bodies carry `audit_written` (V6b).** The receipt head is
+  advertised ONLY when the write landed: a non-widening reject/revoke
+  whose audit entry failed no longer claims a chain receipt, and
+  `audit_surface_refusal` returns `(head, written)` so a surface
+  refusal body never advertises a head for an unwritten entry.
+- **`gateways`: an unprefixed principal resolves to the non-human class
+  (V6c).** `_principal_label` maps a bare string to `hub:<value>`,
+  never `approver:<x>`, so a hub mount cannot be configured to write
+  human-approver provenance into the chain. The room path passes its
+  sender explicitly approver-prefixed, so room labels are byte-identical.
+- **`snapshot` is neutralized and bounded (V6d/V6e).** Every agent- or
+  remote-influenced field that reaches the body (justification, item
+  backend/account/resource/label/ops) is single-physical-line,
+  markdown-neutralized and code-span-safe — the room card's own
+  render-time discipline; each slice is capped at `SNAPSHOT_MAX_ROWS`
+  (256, store order, `truncated: true` in the body when hit) and
+  `expired_recent` drops rows whose effective expiry is older than
+  `SNAPSHOT_EXPIRED_WINDOW` (24h), so the read model is bounded in rows
+  and recency instead of growing forever.
+- **Protected-surface registration is by default (V6f).** Building the
+  approval surface unions its route ids into
+  `core.protected_surfaces` (consult `core.is_protected_surface` at
+  the wall); matching NORMALIZES the candidate path (query string and
+  trailing slashes stripped) so a variant cannot bypass the protected
+  set, and registered ids are canonicalized on the way in.
+- **`min_token_length` 32 is a hard floor (V6g).** A configured value
+  below 32 REFUSES TO START — the token floor is never clamped or
+  lowered.
+- **Undo limitation documented (V6h).** The 15s undo window is armed
+  for the room path only; an API decision cannot be undone from the
+  API in this release (no API undo verb — an owner decision, pending).
+  Documented in the `approvals` module docstring and the README
+  approvals section.
 
 ### Removed
 

@@ -112,8 +112,12 @@ log (unless `allow_without_audit: true` says so out loud) and cannot
 return without a live transport; a screen config that is present but
 malformed refuses the boot even when disabled, and an enabled zero-rule
 screen is refused; a requested operation the registry never declared can
-never be granted; and the CI pipeline now RUNS the parity batteries
-instead of skipping them.
+never be granted; and the CI parity gate cannot be earned by skipping:
+the parity job requires the sibling groupware repo at the configured
+remote and FAILS CLOSED — permanently red, with every skip visible —
+until that repo is published (the sibling remote does not exist today;
+publication sequencing is the owner's, and the workflow itself is
+unchanged).
 
 ## What the core owns
 
@@ -163,9 +167,33 @@ instead of skipping them.
   the THIRD credential class (approval-plane hub/app token, >= 32 chars,
   refuse-to-start, constant-time before any body parse, 4096-byte body
   cap; refusals answer as structured 200 bodies and are audited). The
-  approval routes join the broker's protected surfaces via
-  `register_protected_surfaces` so an agent cannot request_access the
-  plane. No agent-facing tool exists for decisions.
+  approval routes join the broker's protected surfaces — by DEFAULT as
+  of the F1 review round: building the surface unions its ids into
+  `core.protected_surfaces` (consult `core.is_protected_surface`; paths
+  are normalized, so query-string and trailing-slash variants cannot
+  bypass the set) — so an agent cannot request_access the plane. No
+  agent-facing tool exists for decisions.
+
+  The 15s undo window is armed for the ROOM path only: an API decision
+  cannot be undone from the API in this release (there is no API undo
+  verb; an owner decision, pending). A rejected or revoked request is
+  re-opened only from the approval room (`undo <id>`), which files a NEW
+  pending request.
+
+  F1 review round (2026-11-07, same unreleased 0.3.0): a decision
+  replay binds the client `decision_id` to its full decision tuple with
+  a TTL — a mismatching reuse is an audited conflict refusal and a
+  matching retry answers from the live grant state, never a cached
+  outcome; a deeply-nested JSON body answers the structured audited
+  refusal (no raw 500); every decision refusal is audited and the
+  outcome body carries `audit_written`, advertising the chain head only
+  when the write landed; an unprefixed principal resolves to the
+  hub/device class, never the human-approver class; the snapshot
+  neutralizes every field it returns, caps each slice (256 rows,
+  `truncated` flag) and bounds `expired_recent` to a 24h recency
+  window; and the 32-character token floor is hard (a configured lower
+  value refuses to start).
+
 - **`screening`** (v0.2.0, optional): the deterministic content screen
   engine — the content-direction wall that runs BEHIND the access wall.
   Pure, synchronous, no I/O. Per-rule `block` (default, fail-safe) or
