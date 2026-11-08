@@ -3,6 +3,106 @@
 All notable changes to this project are documented in this file.
 Format based on Keep a Changelog; versioning is SemVer.
 
+## [0.3.0] - 2026-11-07
+
+Hygiene round driven by the full supervisory review
+(`reports/supervisoryReviewFull-2026-11-07.md`); no API removals that
+affect a released broker, but three behavior changes are listed first.
+
+### Changed (behavior)
+
+- **`grants`: intake caps on agent-supplied text (P4/P16/P38).**
+  `submit()` now refuses a justification that is not one physical line
+  (newline, C0/C1 control characters and U+2028/U+2029) or longer than
+  `MAX_JUSTIFICATION_LENGTH` (512); more than `MAX_ITEMS` (10) items;
+  and an item `label` that is not one line of at most
+  `MAX_LABEL_LENGTH` (128). Previously all three were unbounded and
+  multi-line, so a hostile justification could forge a second card
+  header and steer a typed `approve N` to a different request.
+- **`gateways`: render is single-line-by-construction (P4/P16/P38).**
+  The justification, the item label and the screen line each render as
+  ONE physical line with markdown emphasis, code ticks, brackets and
+  tildes escaped. Second belt behind the store's intake caps: a row
+  written by an older core still cannot forge a card line.
+- **`policy.check()`: an undeclared operation can never be granted
+  (P24).** A requested op the registry never declared is now denied with
+  the new `Reason.UNDECLARED_OPERATION`, even when a grant row carries
+  the literal string. Previously the ops check trusted the row's own
+  list, so a grant written before a table change silently widened the
+  wall.
+- **`screening.from_config`: validate-then-enable (P7/P18).** The block
+  is validated in full before `enabled` decides anything: a malformed
+  rule, an uncompilable pattern, an unknown key (block, direction block
+  or model block) or a bad action refuses the boot even with
+  `enabled: false` or absent; a disabled rule is still name/pattern
+  validated before it is skipped. An `enabled: true` block with zero
+  rules is refused — it could not distinguish "screen clean" from
+  "screen off" in the audit chain.
+- **`screening.run`: a `BOTH` payload direction is refused** at the
+  payload seam (REFUSED/`screen_error`). `BOTH` is a rule scope; the old
+  code screened such a transit against the outbound list only.
+- **`screening.ScreenResult.audit_value()` returns the fixed audit
+  vocabulary, never `None` (P18).** CLEAR maps to `"clear"` (explicit
+  recording, per `audit.py`'s own wording), a rule block to
+  `"refused"`, an engine failure to `"screen_error"` (mapped by reason —
+  `ScreenVerdict` stays intact and `SCREEN_VALUES` is unchanged), FLAG
+  to `"flagged"`.
+- **`policy.PolicyRegistry` refuses a classifier that contradicts its
+  table (P14)** and refuses bare-string table values (P18) at
+  construction. The fail-open mapping previously pinned by
+  `test_policy_core_coverage.py` is now pinned as a refuse-to-start.
+- **`baselines`: scope containment runs through the wall normalizer
+  (P8-adjacent).** `_resource_within` normalizes both sides with
+  `registry.normalize_resource` and compares with `policy.covers`;
+  `Knowledge/../Secret` no longer matches a `Knowledge` baseline.
+
+### Added
+
+- **Audit ordering on the widening path (P10/A1):** `approve` writes its
+  audit entry through the existing `AuditLog.record(then=...)`
+  write-before-operate seam, so the CAS commit runs only after the entry
+  is durable; a failed audit write leaves the grant pending.
+- **Audit completeness (P26/P27):** one entry per item (a multi-item
+  decision is reconstructable from the chain); `principal="agent"` for
+  the submission and `principal="approver:<id>"` for decisions;
+  `revoke_all` records one row per revoked grant (the synthetic
+  `grant_id=0` summary row is gone). `GrantStore.revoke_all_grants()`
+  returns the revoked numbers and `revoke_all()` keeps its count.
+- **Bounded transport sends (P21):** `notify_request`/`_post` cap every
+  transport call at `send_timeout_seconds` (default 10, configurable per
+  gateway); a timeout logs loudly and raises `TransportError` so an
+  undelivered card is never reported as delivered.
+- **Gateway factory contracts (P15/P29/P30):** `build_gateway` rebinds
+  the core's transport from the adapter (public
+  `core.bind_transport`) and refuses a gateway that cannot send;
+  refuses unknown adapter-section keys against the builder's declared
+  `register_adapter(..., fields=...)`; refuses a `command_prefix` the
+  inbound grammar cannot match; and refuses `audit=None` unless
+  `gateway.allow_without_audit: true` (fail-closed default).
+- **`_resolve_fields` expands list values (P5):** `allowed_senders:
+  ['${OWNER}']` resolves to the owner id (or the boot fails when the
+  variable is unset); `_approver_of` reads the RESOLVED fields.
+- **`reject()` honors effective state (P9):** a stale reject tap on an
+  effectively-expired pending row no longer rewrites its
+  `pending_timeout` story into `rejection`.
+- **CI proves the parity batteries (P6):** the workflow checks the
+  sibling broker out, exports `GROUPWARE_PATH`, and FAILS when any test
+  is skipped — the 274 tests that used to skip now run, and the green
+  pipeline can no longer be 46% of the package.
+- `GrantStore.active_ttl` so the card's expiry label reads the
+  configured TTL instead of a hardcoded constant (P39).
+
+### Removed
+
+- `gateways.base.ApprovalGateway`'s fictional three-method Protocol
+  (`notify_request` was never implemented by any adapter) — replaced by
+  the contract that exists. Dead members removed: `_surface`
+  (write-only), `GatewayTransport.send_to_approver` (never called),
+  `PendingRequest` (never instantiated), the vacuous Protocol test and
+  the pass-body stub `test_empty_grant_list_denies_everything`.
+- The false claim that transports without reactions post the four
+  controls as text lines: the typed grammar is the only decision door.
+
 ## [0.2.0] - 2026-10-01
 
 ### Added

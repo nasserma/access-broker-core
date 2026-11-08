@@ -97,11 +97,23 @@ One repo per broker; no monorepo.
 
 ## Status
 
-v0.1.1, published at the repository above (tag v0.1.1). Two brokers
-consume it in their suites (groupware verified by porting; the data
-broker consumes the published release). The founding compatibility
-matrix, which records the core version each released broker requires,
-lives in CHANGELOG.md and grows with each broker release.
+v0.3.0 (this tree; the last published tag is v0.1.1 and the v0.2.0/v0.3.0
+releases are cut from the hygiene round). Two brokers consume it in their
+suites (groupware verified by porting; the data broker consumes the
+published release). The founding compatibility matrix, which records the
+core version each released broker requires, lives in CHANGELOG.md and
+grows with each broker release.
+
+What v0.3.0 changed in the security posture, in one place: agent-supplied
+card text is capped and rendered single-line-by-construction; the
+approval transition writes its audit entry BEFORE the state commit; bulk
+revokes are per-grant audit rows; a gateway cannot boot without an audit
+log (unless `allow_without_audit: true` says so out loud) and cannot
+return without a live transport; a screen config that is present but
+malformed refuses the boot even when disabled, and an enabled zero-rule
+screen is refused; a requested operation the registry never declared can
+never be granted; and the CI pipeline now RUNS the parity batteries
+instead of skipping them.
 
 ## What the core owns
 
@@ -118,10 +130,16 @@ lives in CHANGELOG.md and grows with each broker release.
   scrubbing, `verify_chain`. Human decisions are audit-class events:
   the approver identity rides in `principal` (suite finding F1, fixed
   2026-09-18).
-- **`gateways`**: the ApprovalGateway interface and the
+- **`gateways`**: the ApprovalGateway adapter contract and the
   transport-agnostic decision core (allowlist first, one-time numbers,
   undo windows, expiry sweep, approval summaries, shared-room routing
-  with a leading `[tag]` on every outbound message). One message format
+  with a leading `[tag]` on every outbound message). The typed command
+  grammar is the only decision door: a transport without native
+  reactions accepts typed commands, and there is deliberately no
+  text-line control fallback (an unclickable "approve" line inside a
+  bot message is indistinguishable from agent-influenced card text).
+  Sends are bounded (`send_timeout_seconds`, default 10) so a hung
+  transport cannot stall the agent's gated tool call. One message format
   grammar serves the whole suite: `[tag] <icon> **<headline>**`, item
   identity on one template-controlled line per item, the agent's
   justification isolated in one labelled line, Matrix-safe markdown
@@ -141,12 +159,22 @@ lives in CHANGELOG.md and grows with each broker release.
   `flag` action; fail-closed on malformed payload and engine errors
   (`screen_error`, never a rule hit); refuse-to-start on malformed
   config; screen off (absent `screening:` key) is byte-identical
-  broker behavior. Deterministic rules scan full bytes; the 8 KiB
-  MODEL_WINDOW_BYTES cap is dormant until the later model annotator
-  lands (a config enabling `screening.model` refuses to start). The
-  screen verdict rides the audit record's optional `screen` field and,
-  for pending requests, one bounded line on the approval card. Design
-  note: `review/contentScreeningDesignNote-2026-10-01.md`.
+  broker behavior. VALIDATE-THEN-ENABLE (v0.3.0): a present-but-
+  malformed block refuses the boot even with `enabled: false` or absent
+  (a bad rule, pattern, action or unknown key cannot hide behind the
+  off switch), a disabled rule is still name/pattern validated, and an
+  enabled block with zero rules is refused because it cannot
+  distinguish "screen clean" from "screen off". A payload direction of
+  `BOTH` is refused (BOTH is a rule scope, not a transit direction).
+  The screen verdict rides the audit record's optional `screen` field
+  with the fixed vocabulary — a clear verdict is recorded explicitly as
+  `clear`, a rule block as `refused`, and an ENGINE failure as
+  `screen_error`, so the chain can tell a rule from a bug. Deterministic
+  rules scan full bytes; the 8 KiB MODEL_WINDOW_BYTES cap is dormant
+  until the later model annotator lands (a config enabling
+  `screening.model` refuses to start). For pending requests the screen
+  rides one bounded line on the approval card. Design note:
+  `review/contentScreeningDesignNote-2026-10-01.md`.
 
 ## What brokers own
 
@@ -169,6 +197,12 @@ an exemption from it.
    never widens capability and never promotes suspended state.
 4. The approval plane is severed from the execution plane; the approval
    gateway must not be the brokered platform+account combination.
+   **BROKER-SIDE property:** the core exposes the seam (approver
+   resolution, allowlist, one gateway per broker) but holds no mechanism
+   that can prove two distinct credentials are in use. Severance and the
+   suite's two-token minimum are DECLARED and enforced by each broker's
+   config validation; the R1-R15 app-era work states them there. Do not
+   read this invariant as something the core enforces.
 5. Human decisions are audit-class events with the approver as
    principal.
 6. The T0/T1 free lane exists in every broker; gating reads and
