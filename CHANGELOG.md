@@ -3,6 +3,109 @@
 All notable changes to this project are documented in this file.
 Format based on Keep a Changelog; versioning is SemVer.
 
+## [0.4.0] - 2026-11-08
+
+The app-protocol BLOCKED-item closure B1–B8 (approval-client design
+note `review/approvalClientDesignNote-2026-11-07.md`, decisions
+D-A..D-N plus the pass amendments; the protocol.md §12 BLOCKED list; the
+R1–R15 supervisory contract from the 2026-11-07 review). The approval
+hub is extended in lockstep against the same wire shapes in this
+release window; adopting brokers re-pin at their next release.
+
+### Breaking (wire contract)
+
+- **The decision route now REQUIRES four app-protocol fields** beyond
+  the verb tuple (`request_number`, `action`, optional
+  `duration_seconds`/`decision_id`):
+  - `issued_at` — when the caller composed the decision,
+    timezone-qualified ISO 8601. Refused (`stale_issued_at`, HTTP-hint
+    409) when further than ±120s from the broker's clock — checked
+    BEFORE the replay cache and before any store read; a naive or
+    unparseable timestamp is refused (`invalid_issued_at`).
+  - `expected_state` — the literal `"pending"`: the caller declares it
+    composed the decision against a pending card (`invalid_expected_state`).
+  - `request_digest` — the canonical sha256 the card carried
+    (64 lowercase hex, `invalid_request_digest` on a bad shape). The
+    broker RECOMPUTES it from the live record and refuses
+    (`request_digest_mismatch`, 409, audited, nothing applied) on
+    disagreement — on the fresh path AND the `decision_id` replay path:
+    what the human signed must be byte-identical to what the broker holds.
+  - `device_id` — which enrolled device decided (`invalid_device_id`).
+  The route stamps its own provenance (`channel="android-app"`,
+  `credential_class="approval-device"`) — never client-declared.
+  The approval hub is updated in lockstep in this release window;
+  released adopters re-pin when they take the surface.
+- **Approve-by-reaction is refused (D-F).** A reaction cannot carry the
+  one-time code, so the 👍 reaction is disabled on the room path:
+  refused visibly with teaching text and audited
+  (`one_time_code_reaction_cannot_carry_code`), the request stays
+  pending. Typed `approve <id> <code>` (or the approval app) is the only
+  approve.
+
+### Added (B1–B8)
+
+- **Audit provenance fields (B1/R6).** Four optional-when-present
+  fields ride the hash chain exactly as custody/screen do: `device_id`
+  (bounded single-line id), `credential_class` (fixed vocabulary:
+  `approval-device`), `channel` (`android-app` | `text-fallback`),
+  `request_digest` (64 lowercase hex). Fail-closed shape/vocabulary
+  gates before the write; legacy chains still verify.
+- **Canonical request digest + short code (B3/B5).**
+  `canonical_request_payload` / `request_digest` / `digest_code`: the
+  authorization's identity bytes (request number + per-item
+  backend/account/resource/sorted-ops/expiry, snapshot-normalized), the
+  sha256 over them, and a base32 first-bytes short code printed on the
+  room card and carried on the app's card for eye cross-check.
+- **One-time approve codes (B4/D-F).** The hub mints a single-use code
+  (8 chars of the no-I/O/0/1 alphabet) and registers it through the new
+  audited `POST <prefix>/code` route (body: `request_number`, `code`,
+  `ttl_seconds` in [60, 900]; refusals `invalid_code` /
+  `invalid_code_ttl` / `unknown_request` / `code_not_pending`, fixed
+  reasons, the code never registered on a refusal; `/code` joins the
+  protected surface ids). Codes are stored hashed, consumed only on a
+  successful gate, in-memory only. Typed approve is code-gated with
+  visible teaching refusals (`code_missing` / `code_malformed` /
+  `code_unknown` / `code_expired` / `code_invalid`), each audited.
+- **Provenance stamping (R6/R11).** Every decision arm and refusal
+  stamps provenance into its chain entries: the approval surface stamps
+  device/credential_class/channel/digest; room decisions (typed,
+  reactions, undo, revoke-all) stamp `channel="text-fallback"` — a
+  mixed-provenance history stays readable in the chain.
+- **Snapshot markers (B5/B8).** Pending and active snapshot rows carry
+  `request_digest` + `digest_code`; both also carry the explicit
+  screen-absence marking `screen: null` +
+  `screen_advisory_incomplete: true` (the core never persists a screen
+  verdict — an absence must never render as a clean pass). The
+  terminal expired slice carries no screen marking.
+- **`parse_reply` gains an approve-only code slot** (4-tuple return):
+  `approve <id> [expiry] <code>`; a code typed after
+  reject/revoke/undo/status is dropped by the parser (the narrowing is
+  approve-only). Room card, help text and Decide line teach the new
+  affordance.
+
+### Owner decisions pending
+
+- **B9 (an API undo verb) is NOT added**: the 15s undo window remains
+  room-path-only, as documented since the F1 round (V6h).
+- **The 120s decision freshness window, the 900s one-time-code maximum
+  TTL and the 60–900s registration window are implementation defaults**
+  flagged for owner confirmation; they are module constants
+  (`DECISION_FRESHNESS_SECONDS`, `ONE_TIME_CODE_MAX_TTL_SECONDS`,
+  `ONE_TIME_CODE_MIN_TTL_SECONDS`), not config, in this release.
+
+### Security notes (details in SECURITY.md)
+
+- The provenance fields ride the hash chain the way custody/screen do —
+  optional-when-present, hashed, fail-closed vocabulary; legacy chains
+  verify unchanged.
+- The decision freshness window (120s) is deliberately tighter than the
+  replay TTL (300s): a replayed decision_id cannot resurrect a
+  decision composed against authorization state older than the window.
+- One-time codes are in-memory only and hashed at rest: a broker
+  restart discards them together with the pending requests they gate
+  (the store's restart-discard rule), so a code can never outlive its
+  request.
+
 ## [0.3.0] - 2026-11-07
 
 Hygiene round driven by the full supervisory review

@@ -97,12 +97,13 @@ One repo per broker; no monorepo.
 
 ## Status
 
-v0.3.0 (this tree; the last published tag is v0.1.1 and the v0.2.0/v0.3.0
-releases are cut from the hygiene round). Two brokers consume it in their
-suites (groupware verified by porting; the data broker consumes the
-published release). The founding compatibility matrix, which records the
-core version each released broker requires, lives in CHANGELOG.md and
-grows with each broker release.
+v0.4.0 (this tree; the last published tag is v0.1.1 and the
+v0.2.0/v0.3.0/v0.4.0 releases are cut from the hygiene and app-protocol
+rounds). Two brokers consume it in their suites (groupware verified by
+porting; the data broker consumes the published release). The founding
+compatibility matrix, which records the core version each released
+broker requires, lives in CHANGELOG.md and grows with each broker
+release.
 
 What v0.3.0 changed in the security posture, in one place: agent-supplied
 card text is capped and rendered single-line-by-construction; the
@@ -118,6 +119,16 @@ remote and FAILS CLOSED — permanently red, with every skip visible —
 until that repo is published (the sibling remote does not exist today;
 publication sequencing is the owner's, and the workflow itself is
 unchanged).
+
+What v0.4.0 (the app-protocol closure B1-B8) adds on top: the decision
+route requires fresh, digest-bound, device-attributed decision bodies
+(±120s freshness, broker-side digest recompute, fixed audited
+refusals); decision provenance (device, credential class, channel,
+digest) rides the hash chain; the room's typed approve is gated on a
+hub-minted one-time code (approve-by-reaction is refused visibly), and
+the snapshot marks the screen verdict's absence explicitly. See the
+approvals entry under "What the core owns", CHANGELOG 0.4.0 and
+SECURITY.md.
 
 ## What the core owns
 
@@ -157,28 +168,69 @@ unchanged).
 - **`custody`**: CustodyRegistry/CustodyClass, the machine-readable
   custody-class declaration layer (S6-1); declarations are
   refuse-to-start validated and ride every audit record.
-- **`approvals`** (v0.3.0, Stage E1a): the REST approvals surface —
-  `apply_decision` (the room path's machinery with a structured outcome
-  carrying the computed capped `expires_at` and the post-write
-  `audit_head`), `snapshot()` (the bounded read model with
+- **`approvals`** (v0.3.0 Stage E1a, extended v0.4.0 B1-B8): the REST
+  approvals surface — `apply_decision` (the room path's machinery with a
+  structured outcome carrying the computed capped `expires_at` and the
+  post-write `audit_head`), `snapshot()` (the bounded read model with
   `pending_deadline` and the store's actual `pending_timeout_seconds`),
   and `build_approval_surface_app` (raw-ASGI mount of
-  `/approval/snapshot|decision|health` beside an MCP app). Its bearer is
-  the THIRD credential class (approval-plane hub/app token, >= 32 chars,
-  refuse-to-start, constant-time before any body parse, 4096-byte body
-  cap; refusals answer as structured 200 bodies and are audited). The
-  approval routes join the broker's protected surfaces — by DEFAULT as
-  of the F1 review round: building the surface unions its ids into
-  `core.protected_surfaces` (consult `core.is_protected_surface`; paths
-  are normalized, so query-string and trailing-slash variants cannot
-  bypass the set) — so an agent cannot request_access the plane. No
-  agent-facing tool exists for decisions.
+  `/approval/snapshot|decision|code|health` beside an MCP app). Its
+  bearer is the THIRD credential class (approval-plane hub/app token,
+  >= 32 chars, refuse-to-start, constant-time before any body parse,
+  4096-byte body cap; refusals answer as structured 200 bodies and are
+  audited). The approval routes join the broker's protected surfaces —
+  by DEFAULT as of the F1 review round: building the surface unions its
+  ids into `core.protected_surfaces` (consult
+  `core.is_protected_surface`; paths are normalized, so query-string and
+  trailing-slash variants cannot bypass the set) — so an agent cannot
+  request_access the plane. No agent-facing tool exists for decisions.
+
+  v0.4.0 (app-protocol closure B1-B8, approval-client design note
+  2026-11-07):
+
+  - **The decision body is digest-bound and device-attributed.** Beyond
+    the verb tuple the route REQUIRES `issued_at` (timezone-qualified,
+    ±120s fresh vs the broker clock, checked before the replay cache
+    and the store), `expected_state="pending"`, `request_digest` (64
+    lowercase hex — the broker RECOMPUTES it from the live record and
+    refuses a mismatch before anything is applied, fresh path and
+    replay path alike) and `device_id`. Each missing/invalid shape has a
+    fixed audited refusal; `stale_issued_at` and
+    `request_digest_mismatch` carry HTTP-hint 409. The route stamps its
+    own `channel="android-app"` + `credential_class="approval-device"`
+    provenance — never client-declared.
+  - **`POST <prefix>/code` (B4/D-F):** the HUB registers a one-time
+    approve code for a PENDING request (8 chars of the no-I/O/0/1
+    alphabet, `ttl_seconds` in [60, 900]); the ROOM's typed
+    `approve <id> <code>` consumes it. The code is single-use, stored
+    hashed, in-memory only (restart-discard safe). Refusals
+    (`invalid_code` / `invalid_code_ttl` / `unknown_request` /
+    `code_not_pending`) are fixed-reason and audited; nothing registers
+    on a refusal.
+  - **Provenance fields (B1/R6).** API decisions stamp
+    device/credential_class/channel/request_digest into every
+    hash-chained audit entry; room decisions stamp
+    `channel="text-fallback"` — the fields ride the chain the way
+    custody/screen do (optional-when-present, fail-closed vocabularies,
+    legacy chains verify).
+  - **Digest codes (B5).** Snapshot pending and active rows carry the
+    canonical `request_digest` plus a short base32 `digest_code` — the
+    same code the room card prints — so the two channels cross-check by
+    eye.
+  - **Screen-absence marking (B8).** The core never persists a screen
+    verdict; pending and active snapshot rows carry `screen: null` +
+    `screen_advisory_incomplete: true` so an absence can never render as
+    a clean pass (the terminal expired slice is unmarked).
+  - **The room's approve is code-gated (D-F).** Typed approve requires
+    the one-time code; the 👍 reaction approve is refused visibly and
+    audited (a reaction cannot carry the code); the card, help text and
+    Decide line teach the typed form.
 
   The 15s undo window is armed for the ROOM path only: an API decision
   cannot be undone from the API in this release (there is no API undo
-  verb; an owner decision, pending). A rejected or revoked request is
-  re-opened only from the approval room (`undo <id>`), which files a NEW
-  pending request.
+  verb; an owner decision, pending — B9 was not added in 0.4.0). A
+  rejected or revoked request is re-opened only from the approval room
+  (`undo <id>`), which files a NEW pending request.
 
   F1 review round (2026-11-07, same unreleased 0.3.0): a decision
   replay binds the client `decision_id` to its full decision tuple with
@@ -272,7 +324,9 @@ migration) is in CHANGELOG.md; each broker release extends it.
 Each broker repository carries its own SECURITY.md with the domain
 threat model, the custody declarations, and the compensating controls
 for that domain. The invariants above are the shared spine those
-documents build on.
+documents build on. The core's own security addendum for the 0.4.0
+app-protocol closure (audit provenance fields, decision freshness vs
+replay TTL, one-time-code lifecycle) is SECURITY.md in this repository.
 
 ## Provenance
 
