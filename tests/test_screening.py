@@ -87,7 +87,10 @@ def test_screen_off_run_is_clear():
     assert result.verdict is ScreenVerdict.CLEAR
     assert result.reason is ScreenReason.CLEAR
     assert result.matched == ()
-    assert result.audit_value() is None
+    # The RESULT is clear; whether a caller with no screen configured
+    # declares the field at all is the caller's choice (audit.py: None =
+    # no screen declared, 'clear' = screen ran and passed).
+    assert result.audit_value() == "clear"
 
 
 def test_enabled_must_be_boolean():
@@ -151,10 +154,63 @@ def test_audit_value_maps_verdict():
         run(one_rule(action=ScreenAction.FLAG), payload("forbidden")).audit_value()
         == "flagged"
     )
-    assert run(one_rule(), payload("clean")).audit_value() is None
+    # A clear verdict is recorded EXPLICITLY (audit.py's own wording): the
+    # chain must distinguish "ran and passed" from "declared no screen".
+    assert run(one_rule(), payload("clean")).audit_value() == "clear"
+
+
+def test_audit_value_distinguishes_engine_failure_from_rule_block():
+    """A rule block is 'refused'; an ENGINE failure is 'screen_error' —
+    both are REFUSED verdicts, so only the reason can tell them apart."""
+    assert run(one_rule(), payload("forbidden")).audit_value() == "refused"
+    assert run(one_rule(), None).audit_value() == "screen_error"
+    assert run(one_rule(), "nope").audit_value() == "screen_error"
+    assert (
+        run(one_rule(), payload("x", direction=ScreenDirection.BOTH)).audit_value()
+        == "screen_error"
+    )
+
+
+def test_every_audit_value_is_in_the_audit_vocabulary():
+    from access_broker_core.audit import SCREEN_VALUES
+
+    samples = [
+        run(None, payload("x")),
+        run(one_rule(), payload("clean")),
+        run(one_rule(), payload("forbidden")),
+        run(one_rule(action=ScreenAction.FLAG), payload("forbidden")),
+        run(one_rule(), None),
+    ]
+    assert {s.audit_value() for s in samples} <= SCREEN_VALUES
 
 
 # --- fail-closed -------------------------------------------------------
+
+
+def test_payload_direction_both_is_refused():
+    """BOTH is a RULE scope, not a payload direction: a bidirectional
+    transit screened against only one list would be half-screened."""
+    result = run(one_rule(), payload("forbidden", direction=ScreenDirection.BOTH))
+    assert result.verdict is ScreenVerdict.REFUSED
+    assert result.reason is ScreenReason.SCREEN_ERROR
+
+
+def test_malformed_config_object_is_screen_error():
+    """Never-raises contract: a config object whose rule list explodes on
+    access yields REFUSED/screen_error, not a traceback."""
+
+    class Exploding:
+        @property
+        def inbound_rules(self):
+            raise RuntimeError("boom")
+
+        outbound_rules = ()
+
+    result = run(  # type: ignore[arg-type]
+        Exploding(), payload("x", direction=ScreenDirection.INBOUND)
+    )
+    assert result.verdict is ScreenVerdict.REFUSED
+    assert result.reason is ScreenReason.SCREEN_ERROR
 
 
 def test_malformed_payload_refused():
@@ -261,9 +317,47 @@ def test_direction_blocks_must_be_mappings():
 
 def test_disabled_rule_is_skipped():
     cfg = from_config(
-        {"enabled": True, "outbound": {"rules": [{"name": "r", "pattern": "forbidden", "enabled": False}]}}
+        {
+            "enabled": True,
+            "outbound": {
+                "rules": [
+                    {"name": "off", "pattern": "forbidden", "enabled": False},
+                    {"name": "on", "pattern": "also-forbidden"},
+                ]
+            },
+        }
     )
     assert run(cfg, payload("forbidden")).verdict is ScreenVerdict.CLEAR
+    assert run(cfg, payload("also-forbidden")).verdict is ScreenVerdict.REFUSED
+
+
+def test_disabled_rule_is_still_validated():
+    """VALIDATE-THEN-SKIP: an off rule's name and pattern are still
+    checked, so a typo cannot hide behind enabled: false."""
+    with pytest.raises(ValueError, match=r"rules\[0\]"):
+        from_config(
+            {
+                "enabled": True,
+                "outbound": {
+                    "rules": [
+                        {"name": "off", "pattern": "(", "enabled": False},
+                        {"name": "on", "pattern": "x"},
+                    ]
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="name"):
+        from_config(
+            {
+                "enabled": True,
+                "outbound": {
+                    "rules": [
+                        {"name": "NOT-a-name", "pattern": "x", "enabled": False},
+                        {"name": "on", "pattern": "x"},
+                    ]
+                },
+            }
+        )
 
 
 def test_enabled_must_be_boolean_per_rule():
@@ -283,9 +377,43 @@ def test_model_block_must_be_mapping():
         from_config({"enabled": True, "model": "nope"})
 
 
+def _one_rule_block():
+    return {"outbound": {"rules": [{"name": "r", "pattern": "x"}]}}
+
+
 def test_model_absent_or_disabled_ok():
-    assert from_config({"enabled": True, "model": {"enabled": False}}) is not None
-    assert from_config({"enabled": True}) is not None
+    assert (
+        from_config({"enabled": True, "model": {"enabled": False}, **_one_rule_block()})
+        is not None
+    )
+    assert from_config({"enabled": True, **_one_rule_block()}) is not None
+
+
+def test_enabled_zero_rules_refuses_start():
+    """P18: an ON screen with no rules cannot distinguish 'screen clean'
+    from 'screen off' in the audit chain — refuse the boot."""
+    with pytest.raises(ValueError, match="zero rules"):
+        from_config({"enabled": True})
+    with pytest.raises(ValueError, match="zero rules"):
+        from_config({"enabled": True, "inbound": {"rules": []}, "outbound": {"rules": []}})
+    # An OFF block with no rules stays OFF (nothing is silently enabled).
+    assert from_config({"enabled": False}) is None
+
+
+def test_malformed_block_refuses_even_when_disabled():
+    """VALIDATE-THEN-ENABLE (P7): enabled: false must not hide a
+    malformed block or an unknown key."""
+    with pytest.raises(ValueError, match="rules"):
+        from_config({"enabled": False, "outbound": {"rules": "nope"}})
+    with pytest.raises(ValueError, match="rules"):
+        from_config({"outbound": {"rules": ["nope"]}})
+    with pytest.raises(ValueError, match="unknown key"):
+        from_config({"enabled": False, "outbound": {"rulez": []}})
+    with pytest.raises(ValueError, match="unknown key"):
+        from_config({"enabled": False, "screnning": {}})
+    with pytest.raises(ValueError, match="unknown key"):
+        from_config({"enabled": True, "model": {"enabled": False, "model_name": "x"},
+                     "outbound": {"rules": [{"name": "r", "pattern": "x"}]}})
 
 
 def test_config_block_must_be_mapping():

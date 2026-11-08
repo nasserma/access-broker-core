@@ -55,6 +55,12 @@ MODEL_WINDOW_BYTES = 8192
 _MAX_RULES = 256
 _MAX_NAME_LENGTH = 128
 
+#: The only keys a screening block may carry (review P7: an unknown key
+#: is a typo or a lie about what the engine does — refuse the boot).
+_BLOCK_KEYS = frozenset({"enabled", "inbound", "outbound", "model"})
+_DIRECTION_KEYS = frozenset({"rules"})
+_MODEL_KEYS = frozenset({"enabled", "window_bytes"})
+
 
 class ScreenAction(enum.Enum):
     """What a deterministic rule hit does. Owner ruling 2026-10-01:
@@ -148,10 +154,26 @@ class ScreenResult:
             or self.verdict is ScreenVerdict.UNSCREENED
         ) or self.verdict is ScreenVerdict.CLEAR
 
-    def audit_value(self) -> str | None:
-        """The optional hashed audit field value (Stage 2 seam): None
-        means the caller does not declare a screen."""
-        return None if self.verdict is ScreenVerdict.CLEAR else self.verdict.value
+    def audit_value(self) -> str:
+        """The hashed audit field value, from the FIXED ``SCREEN_VALUES``
+        vocabulary (audit.py's own wording: a clear verdict is recorded
+        explicitly as 'clear' when the screen ran and passed).
+
+        The mapping is verdict-driven except for one case the verdict
+        enum cannot express: an engine failure is REFUSED like a rule
+        block, but the chain must tell them apart, so ``screen_error``
+        is mapped from the REASON (review P18; this keeps the verdict
+        vocabulary — and therefore ``SCREEN_VALUES`` — intact).
+        """
+        if self.reason is ScreenReason.SCREEN_ERROR:
+            return "screen_error"
+        if self.verdict is ScreenVerdict.REFUSED:
+            return "refused"
+        if self.verdict is ScreenVerdict.FLAGGED:
+            return "flagged"
+        if self.verdict is ScreenVerdict.UNSCREENED:
+            return "unscreened"
+        return "clear"
 
 
 def _compile(value: Any, where: str) -> re.Pattern[str]:
@@ -209,18 +231,26 @@ def _parse_rules(mapping: dict[str, Any], where: str) -> tuple[ScreenRule, ...]:
             raise ValueError(f"screening {where_i}: rule must be a mapping")
         if not isinstance(item.get("enabled", True), bool):
             raise ValueError(f"screening {where_i}: enabled must be a boolean")
+        # VALIDATE-THEN-SKIP (review P7/P18): a disabled rule is still a
+        # rule the owner wrote; a typo'd name, an uncompilable pattern or
+        # an unknown action refuses the boot even though the rule is off.
+        # Skipping validation for disabled rules lets a malformed block
+        # sit in config and detonate the day someone flips enabled.
+        name = _rule_name(item.get("name"), where_i)
+        compiled = _compile(item.get("pattern"), where_i)
+        action = _screen_action(item.get("action"), where_i)
+        direction = _screen_direction(item.get("direction"), where_i)
         if item.get("enabled") is False:
             continue
-        name = _rule_name(item.get("name"), where_i)
         if name in seen:
             raise ValueError(f"screening {where_i}: duplicate rule name {name!r}")
         seen.add(name)
         rules.append(
             ScreenRule(
                 name=name,
-                pattern=_compile(item.get("pattern"), where_i),
-                action=_screen_action(item.get("action"), where_i),
-                direction=_screen_direction(item.get("direction"), where_i),
+                pattern=compiled,
+                action=action,
+                direction=direction,
             )
         )
     if len(rules) > _MAX_RULES:
@@ -230,24 +260,42 @@ def _parse_rules(mapping: dict[str, Any], where: str) -> tuple[ScreenRule, ...]:
 
 def from_config(config: Any) -> ScreenConfig | None:
     """Parse the additive ``screening:`` config block. None = screen OFF
-    (key absent or enabled absent/false): the broker's behavior is
-    byte-identical. A present-but-malformed block raises ValueError —
-    refuse-to-start, never ignore (suite invariant)."""
+    (key absent, or ``enabled`` absent/false with the block otherwise
+    WELL-FORMED): the broker's behavior is byte-identical.
+
+    VALIDATE-THEN-ENABLE (review P7/P18): the block is validated in full
+    BEFORE ``enabled`` decides anything. A present-but-malformed block
+    raises ValueError — refuse-to-start — even when the screen is off or
+    ``enabled`` is absent: ``enabled: false`` must not be a place to hide
+    a typo'd rule that detonates on the next config flip. A screen that
+    is ON must actually screen something: a zero-rule enabled block is
+    refused, because it cannot distinguish "screen clean" from "screen
+    off" in the audit chain (the two record different values).
+    """
 
     if config is None:
         return None
     if not isinstance(config, dict):
         raise ValueError("screening: config block must be a mapping")
+    unknown = sorted(str(key) for key in config if key not in _BLOCK_KEYS)
+    if unknown:
+        raise ValueError(
+            f"screening: unknown key(s) {unknown} (known: {sorted(_BLOCK_KEYS)})"
+        )
     enabled = config.get("enabled")
     if enabled is not None and not isinstance(enabled, bool):
         raise ValueError("screening: enabled must be a boolean")
-    if enabled is not True:
-        return None
     inbound = config.get("inbound", {})
     outbound = config.get("outbound", {})
     for label, block in (("inbound", inbound), ("outbound", outbound)):
         if not isinstance(block, dict):
             raise ValueError(f"screening {label}: must be a mapping")
+        unknown = sorted(str(key) for key in block if key not in _DIRECTION_KEYS)
+        if unknown:
+            raise ValueError(
+                f"screening {label}: unknown key(s) {unknown} "
+                f"(known: {sorted(_DIRECTION_KEYS)})"
+            )
     inbound_rules = _parse_rules(inbound, "inbound")
     outbound_rules = _parse_rules(outbound, "outbound")
     # Model arm is deferred (owner ruling 2026-10-01): a model block may
@@ -257,11 +305,25 @@ def from_config(config: Any) -> ScreenConfig | None:
     if model is not None:
         if not isinstance(model, dict):
             raise ValueError("screening.model: must be a mapping")
+        unknown = sorted(str(key) for key in model if key not in _MODEL_KEYS)
+        if unknown:
+            raise ValueError(
+                f"screening.model: unknown key(s) {unknown} "
+                f"(known: {sorted(_MODEL_KEYS)})"
+            )
         if model.get("enabled") is True:
             raise ValueError(
                 "screening.model: the model annotator is not implemented yet "
                 "(design note §3 step 3, deferred); enabled must be false or absent"
             )
+    if enabled is not True:
+        return None
+    if not inbound_rules and not outbound_rules:
+        raise ValueError(
+            "screening: enabled with zero rules has nothing to screen — it "
+            "cannot distinguish 'screen clean' from 'screen off' in the audit "
+            "chain; add a rule or remove the block (review P18)"
+        )
     return ScreenConfig(inbound_rules=inbound_rules, outbound_rules=outbound_rules)
 
 
@@ -338,9 +400,15 @@ class ScreenConfig:
 
 
 def _valid_payload(payload: Any) -> bool:
+    """A payload is well-formed only if every field has the right type
+    and the direction is a CONCRETE one. ``BOTH`` is a RULE scope, not a
+    payload direction: a payload claiming one would otherwise fall
+    through to the outbound rule list and call a bidirectional transit
+    screened against half the rules (review P18)."""
     return (
         isinstance(payload, ScreenPayload)
         and isinstance(payload.direction, ScreenDirection)
+        and payload.direction is not ScreenDirection.BOTH
         and isinstance(payload.backend, str)
         and isinstance(payload.account, str)
         and isinstance(payload.resource, str)
@@ -368,12 +436,16 @@ def run(config: ScreenConfig | None, payload: Any) -> ScreenResult:
         return ScreenResult(ScreenVerdict.CLEAR, ScreenReason.CLEAR)
     if not _valid_payload(payload):
         return ScreenResult(ScreenVerdict.REFUSED, ScreenReason.SCREEN_ERROR)
-    rules = (
-        config.inbound_rules
-        if payload.direction is ScreenDirection.INBOUND
-        else config.outbound_rules
-    )
     try:
+        # Config reads live INSIDE the try: a malformed config OBJECT
+        # (duck-typed, mutated, or a stub that raises on attribute
+        # access) must yield REFUSED/screen_error per the never-raises
+        # contract, not propagate (review P7).
+        rules = (
+            config.inbound_rules
+            if payload.direction is ScreenDirection.INBOUND
+            else config.outbound_rules
+        )
         blocked: list[str] = []
         flagged: list[str] = []
         for rule in rules:

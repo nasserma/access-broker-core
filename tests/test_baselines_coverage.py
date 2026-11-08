@@ -23,6 +23,15 @@ from access_broker_core.policy import OperationClass, PolicyRegistry
 T0 = datetime(2026, 9, 13, 12, 0, 0)
 
 
+def _normalize(raw, backend):
+    if not isinstance(raw, str):
+        raise ValueError("malformed resource")
+    parts = tuple(part for part in raw.split("/") if part not in ("", "."))
+    if any(part == ".." for part in parts):
+        raise ValueError("escapes namespace")
+    return parts
+
+
 def make_registry() -> PolicyRegistry:
     return PolicyRegistry(
         operation_class={
@@ -31,7 +40,7 @@ def make_registry() -> PolicyRegistry:
             "write": OperationClass.GATED,
         },
         backends=frozenset({"webdav", "onedrive"}),
-        normalize_resource=lambda raw, backend: (),
+        normalize_resource=_normalize,
     )
 
 

@@ -783,6 +783,9 @@ def test_every_reason_member_is_exercised() -> None:
         (grant(), request(resource="Work/../..")),  # ESCAPES_NAMESPACE
         (grant(resource="A"), request(resource="B")),  # NOT_IN_SCOPE
         (grant(ops=["search"]), request(op="delete")),  # OP_NOT_GRANTED
+        # A grant row carrying an operation the registry NEVER declared
+        # used to ALLOW it (the ops check trusted the row's own list).
+        (grant(ops=["undeclared_op"]), request(op="undeclared_op")),  # UNDECLARED_OPERATION
     ]
     for g, r in cases:
         d = check(g, r, static_clock)

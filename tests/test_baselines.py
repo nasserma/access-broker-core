@@ -57,6 +57,17 @@ from access_broker_core.policy import OperationClass, PolicyRegistry
 T0 = datetime(2026, 9, 13, 12, 0, 0)
 
 
+def _normalize(raw, backend):
+    """The wall's normalizer shape for tests: "/"-split components, dot
+    segments dropped, ".." a malformed (escaping) resource."""
+    if not isinstance(raw, str):
+        raise ValueError("malformed resource")
+    parts = tuple(part for part in raw.split("/") if part not in ("", "."))
+    if any(part == ".." for part in parts):
+        raise ValueError("escapes namespace")
+    return parts
+
+
 def make_registry() -> PolicyRegistry:
     return PolicyRegistry(
         operation_class={
@@ -68,7 +79,7 @@ def make_registry() -> PolicyRegistry:
             "mkdir": OperationClass.GATED,
         },
         backends=frozenset({"webdav", "onedrive"}),
-        normalize_resource=lambda raw, backend: (),  # unused by the engine
+        normalize_resource=_normalize,
     )
 
 
@@ -307,6 +318,25 @@ def test_active_baseline_matches_t1(tmp_path: Path) -> None:
     engine.approve_creation(outcome.request_id)
     engine.list_definitions()
     assert engine.baseline_for("agent", "webdav", "personal", "Knowledge", "read") is not None
+
+
+def test_baseline_scope_uses_the_wall_normalizer(tmp_path: Path) -> None:
+    """P8-adjacent: scope containment runs through normalize_resource +
+    covers, not a raw string prefix. 'Knowledge/../Secret' must DENY
+    (it escapes the baseline) even though it starts with 'Knowledge/'."""
+    engine, _store, _clock = make_engine(tmp_path)
+    outcome = engine.create_request(definition(), config_change_request_id="ccr-1")
+    engine.approve_creation(outcome.request_id)
+    assert engine.baseline_for(
+        "agent", "webdav", "personal", "Knowledge/../Secret", "read"
+    ) is None
+    assert engine.baseline_for(
+        "agent", "webdav", "personal", "Knowledge/2026/notes", "read"
+    ) is not None
+    # A sibling that merely shares the string prefix is not in scope.
+    assert engine.baseline_for(
+        "agent", "webdav", "personal", "Knowledgeable", "read"
+    ) is None
 
 
 def test_baseline_never_matches_tier2(tmp_path: Path) -> None:

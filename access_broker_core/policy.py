@@ -64,6 +64,7 @@ class Reason(enum.Enum):
     MALFORMED_GRANT = "malformed_grant"
     MALFORMED_RESOURCE = "malformed_resource"
     NORMALIZATION_FAILURE = "normalization_failure"
+    UNDECLARED_OPERATION = "undeclared_operation"
     EMPTY_RESOURCE = "empty_resource"
     ESCAPES_NAMESPACE = "escapes_namespace"
     NOT_IN_SCOPE = "not_in_scope"
@@ -137,14 +138,55 @@ class PolicyRegistry:
         # identical ("read"/"gated"), but check() compares identity. The
         # registry is the seam boundary, so enum identity is normalized
         # HERE, once, at construction.
-        self.operation_class = {
-            op: OperationClass(cls.value) if hasattr(cls, "value") else cls
-            for op, cls in operation_class.items()
-        }
+        #
+        # A plain STRING (or any non-enum) is refused at construction
+        # (review P18): a str value never compares identity-equal to
+        # OperationClass.READ, so the table would silently classify every
+        # such operation GATED while the broker believed it declared a
+        # read. Values are coerced only when they carry ``.value``.
+        coerced: dict[str, OperationClass] = {}
+        for op, cls in operation_class.items():
+            if not isinstance(op, str) or not op:
+                raise ValueError(
+                    f"policy registry: operation name {op!r} must be a non-empty string"
+                )
+            if isinstance(cls, str) or not hasattr(cls, "value"):
+                raise ValueError(
+                    f"policy registry: operation {op!r} class {cls!r} must be an "
+                    "OperationClass (or an enum with a 'read'/'gated' value); "
+                    "bare strings are refused (fail-closed)"
+                )
+            try:
+                coerced[op] = OperationClass(cls.value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"policy registry: operation {op!r} has unknown class {cls.value!r}"
+                ) from exc
+        self.operation_class = coerced
         self.backends = frozenset(backends)
         self._normalize = normalize_resource
         if classify is not None:
             self._classify = classify
+            # Classifier-vs-table consistency (review P14): the classifier
+            # IS the gate (check() calls it, not the table), so a custom
+            # classifier that contradicts the declared table for any
+            # declared operation silently rewrites the wall. Refuse the
+            # boot instead of pinning a fail-open mapping.
+            for op, declared in self.operation_class.items():
+                try:
+                    produced = self._coerce_class(classify(op))
+                except Exception as exc:  # noqa: BLE001 - broken classifier = refuse boot
+                    raise ValueError(
+                        f"policy registry: custom classifier raised on declared "
+                        f"operation {op!r}: {exc!r}"
+                    ) from exc
+                if produced is not declared:
+                    raise ValueError(
+                        f"policy registry: custom classifier disagrees with the "
+                        f"operation table for {op!r}: table says "
+                        f"{declared.value!r}, classifier says {produced.value!r} "
+                        "(refuse-to-start)"
+                    )
         else:
             table = self.operation_class
 
@@ -154,6 +196,18 @@ class PolicyRegistry:
                 return table.get(operation, OperationClass.GATED)
 
             self._classify = _default_classify
+
+    @staticmethod
+    def _coerce_class(value: Any) -> OperationClass:
+        """Normalize a classifier's output to this module's enum (same
+        value-vocabulary seam as the table coercion)."""
+        if isinstance(value, OperationClass):
+            return value
+        if isinstance(value, str):
+            return OperationClass(value)
+        if hasattr(value, "value"):
+            return OperationClass(value.value)
+        raise ValueError(f"classifier returned {value!r}, not an operation class")
 
     def validate(self) -> None:
         """Refuse-to-start guard: empty registry must stop the boot."""
@@ -172,7 +226,14 @@ class PolicyRegistry:
         return sorted(self.operation_class)
 
     def classify_tier(self, operation: str) -> int:
-        """Map an operation to its tier: 1 (baseline) or 2 (brokered)."""
+        """Map an operation to its tier: 1 (baseline) or 2 (brokered).
+
+        HONESTY NOTE (review P14): this is a broker-side routing helper,
+        NOT a gate. ``check()`` never calls it — the wall's decision is
+        the ops/scope evaluation, and tier routing (baseline vs brokered
+        request) happens in the adopter broker. Do not read this as an
+        enforcement point: a tier number it returns grants nothing.
+        """
         return 1 if self._classify(operation) is OperationClass.READ else 2
 
     def normalize_resource(self, raw: Any, backend: str) -> tuple[str, ...]:
@@ -295,6 +356,13 @@ def check(
     ops: Iterable[Any] = raw_ops
     if not all(isinstance(item, str) for item in ops):
         return deny(Reason.MALFORMED_GRANT)
+
+    # An operation the REGISTRY never declared can never be granted, even
+    # when a grant row carries the literal string (review P24: a grant
+    # written before a table change, or by a buggy caller, used to widen
+    # the wall here because the ops check trusted the row's own list).
+    if op not in registry.operation_class:
+        return deny(Reason.UNDECLARED_OPERATION)
 
     if op in ops:
         return Decision(True, Reason.OK)

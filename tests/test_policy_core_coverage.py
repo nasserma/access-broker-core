@@ -50,17 +50,53 @@ def test_registry_validate_passes_when_populated():
     _registry().validate()
 
 
-def test_registry_custom_classify_used():
+def test_registry_custom_classify_agreeing_with_table_is_used():
+    """P14: a custom classifier is only accepted when it AGREES with the
+    declared table for every declared operation. (The old test pinned the
+    fail-open mapping: a classifier that called a GATED op READ was
+    accepted, and the wall obeyed it.)"""
     calls = []
 
     def custom(op):
         calls.append(op)
-        return OperationClass.READ
+        return {"read": OperationClass.READ, "send": OperationClass.GATED}.get(
+            op, OperationClass.GATED
+        )
 
     r = _registry(classify=custom)
-    assert r.classify("anything") is OperationClass.READ
+    # construction probed the declared set once
+    assert sorted(calls) == ["read", "send"]
+    calls.clear()
+    assert r.classify("anything") is OperationClass.GATED
     assert calls == ["anything"]
-    assert r.classify_tier("anything") == 1
+    assert r.classify_tier("read") == 1
+    assert r.classify_tier("send") == 2
+
+
+def test_registry_custom_classify_contradicting_table_refuses_start():
+    def custom(op):
+        return OperationClass.READ  # claims EVERY op is a read, including "send"
+
+    with pytest.raises(ValueError, match="disagrees"):
+        _registry(classify=custom)
+
+
+def test_registry_custom_classify_raising_on_a_declared_op_refuses_start():
+    def custom(op):
+        raise KeyError(op)
+
+    with pytest.raises(ValueError, match="classifier raised"):
+        _registry(classify=custom)
+
+
+def test_registry_refuses_string_valued_operation_table():
+    """P18: a bare string never identity-compares to OperationClass.READ,
+    so it would silently classify as GATED while the broker believed it
+    declared a read. Refuse at construction instead."""
+    with pytest.raises(ValueError, match="bare strings are refused"):
+        _registry(operation_class={"read": "read", "send": "gated"})
+    with pytest.raises(ValueError, match="non-empty string"):
+        _registry(operation_class={"": OperationClass.READ})
 
 
 def test_default_classify_tier_read_and_gated():

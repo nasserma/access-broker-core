@@ -95,7 +95,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from access_broker_core.grants import GrantStore
-from access_broker_core.policy import OperationClass, PolicyRegistry
+from access_broker_core.policy import OperationClass, PolicyRegistry, covers
 
 ACTIVE = "ACTIVE"
 PENDING_RECONFIRM = "PENDING_RECONFIRM"
@@ -175,17 +175,29 @@ def definition_hash(definition: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _resource_within(resource: str, base: str) -> bool:
-    """Exact component-prefix containment on path-like resources.
+def _resource_within(
+    registry: PolicyRegistry, resource: str, base: str, backend: str
+) -> bool:
+    """Exact component-prefix containment, through the WALL's normalizer.
 
-    Reuses the suite's covers() rule at the component level:
-    'Knowledge' covers 'Knowledge' and 'Knowledge/2026' but never
-    'Knowledgeable'. Component boundaries are the only legal prefix
-    ends; a longer bare prefix is refused (fail closed).
+    Both sides are normalized by the registry's resource normalizer and
+    compared with the same :func:`access_broker_core.policy.covers` rule
+    check() uses (review P8-adjacent): baselines and grants must judge
+    scope identically. The local string-prefix test this replaces read
+    'Knowledge/../Secret' as inside 'Knowledge' — the raw string starts
+    with the base even though the normalized path escapes it.
+
+    A normalizer failure (hostile or undecodable resource) or an empty
+    base scope matches nothing: fail closed, never raise.
     """
-    if resource == base:
-        return True
-    return resource.startswith(base + "/")
+    try:
+        base_components = registry.normalize_resource(base, backend)
+        resource_components = registry.normalize_resource(resource, backend)
+    except Exception:  # noqa: BLE001 - hostile resource = no match
+        return False
+    if not base_components:
+        return False
+    return covers(base_components, resource_components)
 
 
 @dataclass(frozen=True)
@@ -278,7 +290,15 @@ class BaselineEngine:
     def modify_request(
         self, baseline_id: int, new_definition: dict[str, Any], config_change_request_id: str
     ) -> int:
-        """Submit a gated mutation request (a change is NOT a restoration)."""
+        """Submit a gated mutation request (a change is NOT a restoration).
+
+        OWNER RULING D4 (pending): whether a modification must ALSO pass
+        the human approval gateway — a second gate on top of the
+        ``config_change_request_id`` provenance — is undecided. It is
+        deliberately NOT implemented here and must not be added or
+        removed without the ruling. The provenance requirement below
+        stands regardless.
+        """
         if not config_change_request_id:
             raise ValueError("config_change_request_id is required (gated mutation, F-D)")
         clean = self._validate_definition(new_definition)
@@ -451,7 +471,7 @@ class BaselineEngine:
             if definition.get("account") != account:
                 continue
             base = definition.get("resource") or ""
-            if base and not _resource_within(resource, base):
+            if base and not _resource_within(self._registry, resource, base, backend):
                 continue  # exact component-prefix containment (covers())
             if op in (definition.get("ops") or []):
                 return {
@@ -468,6 +488,11 @@ class BaselineEngine:
         PENDING_CREATION rows are excluded: a definition exists only
         once the owner has approved it (F-D: the gated request path
         creates nothing until the human yes).
+
+        NOTE (2026-11-07 hygiene round): the PENDING_CREATION rows
+        themselves have no age-out — an abandoned creation request sits
+        invisible in the table forever. Left as-is this round (it grants
+        nothing and matches nothing); flagged for the adopter work.
         """
         cur = self._db.execute(
             "SELECT * FROM baselines WHERE state != 'PENDING_CREATION'"
