@@ -153,6 +153,19 @@ instead of skipping them.
 - **`custody`**: CustodyRegistry/CustodyClass, the machine-readable
   custody-class declaration layer (S6-1); declarations are
   refuse-to-start validated and ride every audit record.
+- **`approvals`** (v0.3.0, Stage E1a): the REST approvals surface —
+  `apply_decision` (the room path's machinery with a structured outcome
+  carrying the computed capped `expires_at` and the post-write
+  `audit_head`), `snapshot()` (the bounded read model with
+  `pending_deadline` and the store's actual `pending_timeout_seconds`),
+  and `build_approval_surface_app` (raw-ASGI mount of
+  `/approval/snapshot|decision|health` beside an MCP app). Its bearer is
+  the THIRD credential class (approval-plane hub/app token, >= 32 chars,
+  refuse-to-start, constant-time before any body parse, 4096-byte body
+  cap; refusals answer as structured 200 bodies and are audited). The
+  approval routes join the broker's protected surfaces via
+  `register_protected_surfaces` so an agent cannot request_access the
+  plane. No agent-facing tool exists for decisions.
 - **`screening`** (v0.2.0, optional): the deterministic content screen
   engine — the content-direction wall that runs BEHIND the access wall.
   Pure, synchronous, no I/O. Per-rule `block` (default, fail-safe) or

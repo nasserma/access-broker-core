@@ -89,6 +89,36 @@ affect a released broker, but three behavior changes are listed first.
   sibling broker out, exports `GROUPWARE_PATH`, and FAILS when any test
   is skipped — the 274 tests that used to skip now run, and the green
   pipeline can no longer be 46% of the package.
+- **`approvals`: the REST approvals surface (goal-contract Stage E1a).**
+  New module `access_broker_core/approvals.py`, no framework dependency
+  (raw ASGI; the core venv carries no starlette). Public
+  `apply_decision(request_number, action, duration, principal,
+  announce=True)` on `ApprovalGatewayCore` — the same machinery the room
+  path uses (`_decide` is its thin caller), returning a structured
+  outcome: applied/refused, state, state_source, the COMPUTED capped
+  `expires_at`, the `RejectReason` value, the item count, and
+  `audit_head` (the post-write chain head, so a client can verify the
+  decision landed in the audit chain). The three refusal states
+  (unknown_request / already_decided / expired) are distinguishable in
+  the outcome; every refusal — including malformed body, oversize and
+  invalid-number rejections — is audited with a fixed reason and never
+  applied. `core.snapshot()` returns the bounded read model: generated_at,
+  pending_timeout_seconds (the store's actual value, never hardcoded),
+  pending entries with `pending_deadline = created_at + pending_timeout`,
+  separate expired_recent slice, counts; queries only stored
+  pending/active rows, never a history walk.
+  `build_approval_surface_app(core, token_env_name, options)` mounts the
+  routes (`/approval/snapshot`, `/approval/decision`, `/approval/health`)
+  as a beside-the-MCP app: the bearer is the THIRD credential class
+  (approval-plane hub/app token, minimum 32 chars, refuse-to-start on
+  unset/short), compared constant-time BEFORE any body parse, body cap
+  4096 bytes, and a refusal answers with a structured 200 body (an
+  authoritative refusal is never a 4xx; the hint rides in the body).
+  Client `decision_id` gives a bounded idempotent-replay window.
+  `register_protected_surfaces(target, surfaces)` unions the approval
+  surface + every route id into a broker's protected surface set (the
+  comms BrokerContext pattern) so an agent cannot request_access the
+  approval plane. No agent-facing tool is added.
 - `GrantStore.active_ttl` so the card's expiry label reads the
   configured TTL instead of a hardcoded constant (P39).
 
