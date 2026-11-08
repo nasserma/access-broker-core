@@ -58,7 +58,7 @@ import enum
 import json
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -498,6 +498,14 @@ class GrantStore:
         reads this instead of a hardcoded constant, review P39)."""
         return self._active_ttl
 
+    @property
+    def pending_timeout(self) -> timedelta:
+        """The configured pending-request timeout (the approval surface
+        reports it to clients verbatim: a hub or app that hardcodes 12h
+        drifts silently the day a broker configures another value —
+        design note, third pass)."""
+        return self._pending_timeout
+
     # ---------------------------------------------------------------- reading
 
     def _row(self, request_number: int) -> sqlite3.Row | None:
@@ -574,6 +582,32 @@ class GrantStore:
         if row is None:
             raise LookupError(f"no grant with request number {request_number}")
         return self._record(row)
+
+    def records_in_states(self, states: Iterable[str]) -> list[GrantRecord]:
+        """Effective-state records whose STORED state is one of ``states``.
+
+        A bounded read for the approval surface: it queries only the
+        rows a live approval plane can act on (``pending``/``active``)
+        instead of walking the whole decision history, then returns
+        them as effective-state records — a past-deadline pending row
+        still comes back carrying its synthesized ``pending_timeout``
+        state, so the caller never has to re-derive expiry.
+
+        Read-only; applies no transitions and writes nothing. Unknown
+        state names are ignored (the store's state vocabulary is fixed)
+        rather than being interpolated into SQL.
+        """
+        allowed = (PENDING, ACTIVE, EXPIRED, REVOKED, REJECTED)
+        wanted = [state for state in states if state in allowed]
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        query = (
+            f"SELECT * FROM grants WHERE state IN ({placeholders})"  # noqa: S608
+            " ORDER BY request_number"
+        )
+        cur = self._db.execute(query, tuple(wanted))
+        return [self._record(row) for row in cur.fetchall()]
 
     def all_records(self) -> list[GrantRecord]:
         """Every grant row as an effective-state GrantRecord, ordered by

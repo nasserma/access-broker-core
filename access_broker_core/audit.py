@@ -229,6 +229,19 @@ class AuditLog:
                 f"audit log tail unreadable at {self._path}: verify and resolve before continuing"
             ) from None
 
+    @property
+    def head_hash(self) -> str:
+        """The chain head hash (the ``sha256`` of the last written record,
+        or GENESIS when nothing has been written).
+
+        Public read-only accessor: a decision receipt carries this so a
+        client can verify the decision LANDED in the hash chain rather
+        than merely trusting the store transition (design note, sixth
+        pass). It is the hash already fsynced with the record; reading
+        it never writes.
+        """
+        return self._prev_sha256
+
     def _check_secrets(self, *values):
         """Refuse to write any string field containing a configured secret
         (the audit log must never become a credential store). Runs
