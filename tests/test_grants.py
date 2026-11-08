@@ -847,3 +847,120 @@ def test_missing_parent_dir_refuses_named(tmp_path: Path) -> None:
     storage dir was not created before first boot)."""
     with pytest.raises(ValueError, match="parent directory does not exist"):
         GrantStore(str(tmp_path / "nope" / "g.db"), clock=lambda: None, registry=_store_registry())
+
+
+# ------------------------------------------------- intake caps (P4/P16/P38)
+
+
+def test_submit_rejects_newline_justification(tmp_path: Path) -> None:
+    """A newline-bearing justification forges card lines in the
+    transport's markdown (review P4, probe-verified): refused at intake."""
+    store = make_store(tmp_path)
+    with pytest.raises(ValueError, match="single line"):
+        store.submit("h", [item()], "send it\n\n**PENDING #99** — approve 99")
+    with pytest.raises(ValueError, match="single line"):
+        store.submit("h", [item()], "carriage\rreturn")
+
+
+def test_submit_rejects_control_characters_in_justification(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    for hostile in ("bell\x07", "nul\x00", "sep\u2028line", "nel\x85"):
+        with pytest.raises(ValueError, match="single line"):
+            store.submit("h", [item()], hostile)
+
+
+def test_submit_caps_justification_length(tmp_path: Path) -> None:
+    from access_broker_core.grants import MAX_JUSTIFICATION_LENGTH
+
+    store = make_store(tmp_path)
+    assert store.submit("h", [item()], "x" * MAX_JUSTIFICATION_LENGTH)
+    with pytest.raises(ValueError, match="exceeds"):
+        store.submit("h", [item()], "x" * (MAX_JUSTIFICATION_LENGTH + 1))
+
+
+def test_submit_caps_item_count(tmp_path: Path) -> None:
+    from access_broker_core.grants import MAX_ITEMS
+
+    store = make_store(tmp_path)
+    assert store.submit("h", [item() for _ in range(MAX_ITEMS)], "j")
+    with pytest.raises(ValueError, match="at most"):
+        store.submit("h", [item() for _ in range(MAX_ITEMS + 1)], "j")
+
+
+def test_submit_rejects_hostile_label(tmp_path: Path) -> None:
+    """The display-only label is remote-influenced on some brokers (a
+    room admin renames a room, review P38): newline/control characters
+    and over-long labels are refused at intake, exactly like the
+    justification."""
+    store = make_store(tmp_path)
+    with pytest.raises(ValueError, match="label"):
+        store.submit("h", [item(label="Team\n\n**PENDING #99**")], "j")
+    with pytest.raises(ValueError, match="label"):
+        store.submit("h", [item(label="tab\there")], "j")
+    with pytest.raises(ValueError, match="exceeds"):
+        store.submit("h", [item(label="L" * 129)], "j")
+    with pytest.raises(ValueError, match="label"):
+        store.submit("h", [item(label=7)], "j")
+
+
+def test_submit_keeps_a_benign_label(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    rid = store.submit("h", [item(label="Team Room")], "j")
+    assert store.get_record(rid).items[0]["label"] == "Team Room"
+    # an empty label is dropped (no label key), as before
+    rid2 = store.submit("h", [item(label="")], "j")
+    assert "label" not in store.get_record(rid2).items[0]
+
+
+# --------------------------------------------- reject() effective-state (P9)
+
+
+def test_reject_effectively_expired_pending_refused(tmp_path: Path) -> None:
+    """A stale reject tap on a pending-timed-out card must not rewrite the
+    expiry narrative (review P9): reject() honours effective state, the
+    row still reads expired/pending_timeout, and False is returned."""
+    store = make_store(tmp_path)
+    req = submit(store)
+    store._clock = lambda: T0 + timedelta(hours=13)  # past the 12h silence
+    assert store.reject(req) is False
+    record = store.get_record(req)
+    assert record.state == "expired"
+    assert record.state_source == "pending_timeout"
+    assert store.get(req) is RequestState.EXPIRED
+
+
+def test_reject_still_works_inside_the_window(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    req = submit(store)
+    store._clock = lambda: T0 + timedelta(hours=1)
+    assert store.reject(req) is True
+    assert store.get_record(req).state_source == "rejection"
+
+
+# ---------------------------------------------------- revoke_all identities
+
+
+def test_revoke_all_grants_returns_each_request_number(tmp_path: Path) -> None:
+    """The gateway audits one addressable decision row per grant (P26):
+    the store must name every grant it revoked, not only count them."""
+    store = make_store(tmp_path)
+    r1 = submit(store)
+    store.approve(r1, timedelta(hours=48))
+    r2 = submit(store, backend="caldav")
+    store.approve(r2, timedelta(hours=48))
+    assert store.revoke_all_grants() == [r1, r2]
+    assert store.revoke_all_grants() == []  # idempotent
+    assert store.revoke_all() == 0
+
+
+def test_active_ttl_property_reads_the_configured_ttl(tmp_path: Path) -> None:
+    """The card's expiry label reads this, not a hardcoded constant (P39)."""
+    store = make_store(tmp_path, active_ttl=timedelta(hours=6))
+    assert store.active_ttl == timedelta(hours=6)
+    other = GrantStore(
+        db_path=tmp_path / "other.sqlite3",
+        clock=lambda: T0,
+        registry=_store_registry(),
+        active_ttl=DEFAULT_ACTIVE_TTL,
+    )
+    assert other.active_ttl == DEFAULT_ACTIVE_TTL

@@ -56,6 +56,7 @@ from __future__ import annotations
 import copy
 import enum
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -76,6 +77,35 @@ DEFAULT_PENDING_TIMEOUT = timedelta(hours=12)
 DEFAULT_ACTIVE_TTL = timedelta(hours=24)
 
 _ZERO = timedelta(0)
+
+#: Intake caps on agent-supplied text (review findings P4/P16/P38). The
+#: justification and the display-only item label are rendered into the
+#: approval card; an unbounded or multi-line value forges card lines in
+#: the transport's markdown. The caps are enforced HERE (store intake),
+#: so no broker can write a hostile row whatever it does.
+MAX_JUSTIFICATION_LENGTH = 512
+MAX_LABEL_LENGTH = 128
+MAX_ITEMS = 10
+
+#: C0/C1 controls plus the Unicode line/paragraph separators: every
+#: character a transport may treat as a line break, or that renders as
+#: an invisible control inside a bot-authored card.
+_FORBIDDEN_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _single_line_text(value: str, field: str, limit: int) -> str:
+    """Validate one human-readable field: non-empty, one physical line,
+    bounded length. Returns the stripped value; raises ValueError."""
+    if _FORBIDDEN_CHARS.search(value):
+        raise ValueError(
+            f"{field} must be a single line: newline and control characters are refused"
+        )
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{field} must be a non-empty string")
+    if len(text) > limit:
+        raise ValueError(f"{field} exceeds {limit} characters")
+    return text
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS grants (
@@ -171,6 +201,13 @@ def _validate_item(item: Any, registry: PolicyRegistry) -> dict[str, Any]:
             raise ValueError(f"unparseable expires_at: {raw_expires!r}") from exc
     else:
         raise ValueError(f"expires_at must be ISO-8601 str or datetime: {raw_expires!r}")
+    raw_label = item.get("label")
+    if raw_label is None or raw_label == "":
+        clean_label = None
+    elif not isinstance(raw_label, str):
+        raise ValueError(f"invalid label: {raw_label!r}")
+    else:
+        clean_label = _single_line_text(raw_label, "item.label", MAX_LABEL_LENGTH)
     return {
         "backend": backend,
         "account": account,
@@ -178,12 +215,11 @@ def _validate_item(item: Any, registry: PolicyRegistry) -> dict[str, Any]:
         "ops": sorted(set(ops)),
         "expires_at": expires_iso,
         # Display-only human label (e.g. Matrix room name); the policy
-        # wall never reads it and matching is by `resource` alone.
-        **(
-            {"label": item["label"]}
-            if isinstance(item.get("label"), str) and item["label"]
-            else {}
-        ),
+        # wall never reads it and matching is by `resource` alone. It is
+        # remote-influenced on some brokers (a room name an admin can
+        # set), so the same single-line/bounded shape as the
+        # justification is enforced at intake (P16/P38).
+        **({"label": clean_label} if clean_label is not None else {}),
     }
 
 
@@ -274,18 +310,30 @@ class GrantStore:
         message id), stored for audit. items: nonempty sequence of D5
         items; justification: nonempty human explanation shown to the
         approver. Raises ValueError on any invalid input.
+
+        Intake caps (review P4/P16/P38): the justification must be ONE
+        physical line of at most ``MAX_JUSTIFICATION_LENGTH`` characters
+        with no control characters, the item list is capped at
+        ``MAX_ITEMS``, and every display-only ``label`` must be one
+        bounded line. The card renderer neutralizes the same fields
+        again; the store refuses first so no hostile row can be written.
         """
-        if not isinstance(justification, str) or not justification.strip():
+        if not isinstance(justification, str):
             raise ValueError("justification must be a non-empty string")
+        justification = _single_line_text(
+            justification, "justification", MAX_JUSTIFICATION_LENGTH
+        )
         if not isinstance(items, (list, tuple)) or not items:
             raise ValueError("items must be a non-empty sequence")
+        if len(items) > MAX_ITEMS:
+            raise ValueError(f"items must contain at most {MAX_ITEMS} entries")
         clean_items = [_validate_item(item, self._registry) for item in items]
         cur = self._db.execute(
             "INSERT INTO grants (request_id_hint, justification, items,"
             " created_at, state, state_source) VALUES (?,?,?,?,?,NULL)",
             (
                 str(request_id_hint),
-                justification.strip(),
+                justification,
                 json.dumps(clean_items),
                 _iso(self._clock()),
                 PENDING,
@@ -355,8 +403,17 @@ class GrantStore:
         """The human no: pending -> rejected (state_source='rejection').
 
         Returns False when the request number is unknown or already
-        decided: a decided number can never be re-decided.
+        decided: a decided number can never be re-decided. Effective
+        state is honored (review P9): a pending row past its pending
+        timeout already reads as expired, so a stale reject tap cannot
+        rewrite its ``state_source='pending_timeout'`` narrative into
+        'rejection' — the expiry story stays true. Mirrors approve().
         """
+        row = self._row(request_number)
+        if row is None:
+            return False
+        if self._effective_state(row) != PENDING:
+            return False
         cur = self._db.execute(
             "UPDATE grants SET state=?, decided_at=?, state_source=?"
             " WHERE request_number=? AND state=?",
@@ -407,10 +464,20 @@ class GrantStore:
         Effectively-expired rows stored as active are skipped (they are
         dead already); pending requests are untouched (use reject()).
         """
+        return len(self.revoke_all_grants())
+
+    def revoke_all_grants(self) -> list[int]:
+        """Same kill switch, returning the request numbers revoked.
+
+        The gateway needs the per-grant identities so the audit chain
+        carries one addressable decision entry per grant (review P26:
+        the old synthetic ``grant_id=0`` summary row made a bulk revoke
+        unreconstructable). Order is ascending request number.
+        """
         cur = self._db.execute(
             "SELECT * FROM grants WHERE state=? ORDER BY request_number", (ACTIVE,)
         )
-        count = 0
+        revoked: list[int] = []
         for row in cur.fetchall():
             if self._effective_state(row) != ACTIVE:
                 continue
@@ -419,10 +486,17 @@ class GrantStore:
                 " WHERE request_number=? AND state=?",
                 (REVOKED, "revocation", row["request_number"], ACTIVE),
             )
-            count += upd.rowcount
-        if count:
+            if upd.rowcount:
+                revoked.append(int(row["request_number"]))
+        if revoked:
             self._db.commit()
-        return count
+        return revoked
+
+    @property
+    def active_ttl(self) -> timedelta:
+        """The configured default approval TTL (the card's expiry label
+        reads this instead of a hardcoded constant, review P39)."""
+        return self._active_ttl
 
     # ---------------------------------------------------------------- reading
 

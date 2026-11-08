@@ -164,7 +164,8 @@ class Env:
             assert fields.get("user_id") == "@brokerbot:example.org"
             assert fields.get("access_token") == "secret-token-value"
             assert fields.get("room_id") == "!approvalroom:example.org"
-            core._transport = self.transport  # same rebind _build_matrix did
+            # NO private transport assignment here: the factory rebinds the
+            # core from adapter.transport (review P15 sendability contract).
             return FakeMatrixGateway(core, self.transport), fields["room_id"]
 
         from access_broker_core.gateways import register_adapter
@@ -203,7 +204,9 @@ def test_factory_wires_core_and_adapter(env: Env):
     assert adapter.transport is env.transport
     assert adapter.started is False  # start() is the server's call
     assert core._approver == APPROVER
-    assert core._surface == "!approvalroom:example.org"
+    # the factory bound the adapter's transport: the core can actually send
+    assert core.transport is env.transport
+    assert core.has_live_transport is True
 
 
 def test_factory_rejects_unknown_adapter(env: Env):
@@ -365,7 +368,8 @@ async def test_f1_submit_decision_audited(env: Env, tmp_path: Path):
     assert len(submitted) == 1
     entry = submitted[0]
     assert entry["grant_id"] == number
-    assert entry["principal"] == f"approver:{APPROVER}"
+    # P27: the agent authored the request; the human made no decision here
+    assert entry["principal"] == "agent"
     assert entry["account"] == "work"
     assert entry["resource"] == "Sent"
     assert entry["operation"] == "send"
@@ -430,8 +434,10 @@ async def test_f1_revoke_all_audited(env: Env, tmp_path: Path):
     assert env.store.get(number) is RequestState.REVOKED
 
     records = _audit_records(tmp_path / "audit.jsonl")
-    bulk = [r for r in records if "revoke_all" in (r.get("reason") or "")]
+    bulk = [r for r in records if r.get("reason") == "revoke_all"]
+    # P26: one addressable row per grant, never a synthetic grant_id=0
     assert len(bulk) == 1
+    assert bulk[0]["grant_id"] == number
     assert bulk[0]["principal"] == f"approver:{APPROVER}"
 
 
@@ -449,9 +455,10 @@ async def test_f1_undo_decision_audited(env: Env, tmp_path: Path):
 
 
 async def test_f1_approve_fails_closed_on_audit_write_failure(env: Env, tmp_path: Path):
-    """The F1 fail-closed path: an approve whose audit write fails is NOT
-    confirmed to the approver; the room gets an explicit warning instead.
-    The grant exists in the store but was never visibly confirmed."""
+    """RE-PINNED for write-before-operate (review P10/A1): the approval
+    entry is written BEFORE the CAS transition, so a failed audit write
+    means the store is never asked to widen — the grant stays PENDING and
+    the approver sees an explicit refusal, not a confirmation."""
     from access_broker_core.audit import LogWriteError
 
     number = env.submit()
@@ -466,11 +473,11 @@ async def test_f1_approve_fails_closed_on_audit_write_failure(env: Env, tmp_path
     env.audit.record = broken_record  # type: ignore[method-assign]
     await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
 
-    # the store DID transition (store semantics are unchanged)...
-    assert env.store.get(number) is RequestState.ACTIVE
-    # ...but the approver saw the warning, NOT a confirmation
+    # the widening transition does NOT survive a failed audit write
+    assert env.store.get(number) is RequestState.PENDING
+    # the approver saw the refusal warning, NOT a confirmation
     assert not any("Approved #" in t for t in env.transport.sent)
-    assert any("audit" in t.lower() and "FAILED" in t for t in env.transport.sent)
+    assert any("REFUSED" in t and "NOT activated" in t for t in env.transport.sent)
     env.audit.record = original_record  # restore for teardown
 
 
@@ -606,3 +613,93 @@ async def test_f1_revoke_unknown_refused(env: Env):
     """Branch coverage: revoking an unknown number reports refusal."""
     await env.core.handle_reply(APPROVER, "revoke 999")
     assert any("Cannot revoke" in t for t in env.transport.sent)
+
+
+# ---------------------------------------------------------------------------
+# Audit completeness + ordering (P10/A1, P26, P27)
+# ---------------------------------------------------------------------------
+
+MULTI_ITEMS = [
+    ITEM,
+    {"backend": "caldav", "account": "work", "resource": "Cal", "ops": ["create"]},
+    {"backend": "carddav", "account": "work", "resource": "Contacts", "ops": ["update"]},
+]
+
+
+async def test_submit_audit_records_every_item_with_agent_principal(
+    env: Env, tmp_path: Path
+):
+    """P26/P27: a multi-item submission writes ONE entry per item, each
+    credited to the agent (who authored the request)."""
+    number = env.submit(items=tuple(MULTI_ITEMS))
+    await env.core.notify_request(number, "j", MULTI_ITEMS)
+
+    submitted = [
+        r for r in _audit_records(tmp_path / "audit.jsonl")
+        if r["decision"] == "submitted"
+    ]
+    assert len(submitted) == len(MULTI_ITEMS)
+    assert {r["principal"] for r in submitted} == {"agent"}
+    assert {r["resource"] for r in submitted} == {"Sent", "Cal", "Contacts"}
+    assert {r["grant_id"] for r in submitted} == {number}
+
+
+async def test_approve_audit_records_every_item(env: Env, tmp_path: Path):
+    """P26: only items[0] used to be recorded; the chain must carry the
+    whole authorized payload for a multi-item approval."""
+    number = env.submit(items=tuple(MULTI_ITEMS))
+    event_id = await env.core.notify_request(number, "j", MULTI_ITEMS)
+    await env.core.handle_reaction(APPROVER, event_id, APPROVE_EMOJI)
+    assert env.store.get(number) is RequestState.ACTIVE
+
+    approved = [
+        r for r in _audit_records(tmp_path / "audit.jsonl")
+        if r["decision"] == "approved" and r["grant_id"] == number
+    ]
+    assert len(approved) == len(MULTI_ITEMS)
+    assert {r["operation"] for r in approved} == {"send", "create", "update"}
+    assert {r["principal"] for r in approved} == {f"approver:{APPROVER}"}
+
+
+async def test_revoke_all_writes_one_addressable_row_per_grant(env: Env, tmp_path: Path):
+    """P26: the synthetic grant_id=0 summary row is gone; each revoked
+    grant gets its own entry."""
+    first = env.submit()
+    second = env.submit(items=({"backend": "caldav", "account": "work", "resource": "Cal", "ops": ["create"]},))
+    for rid in (first, second):
+        await env.core.notify_request(rid, "j", [ITEM] if rid == first else [])
+        await env.core.handle_reply(APPROVER, f"approve {rid}")
+    await env.core.handle_reply(APPROVER, "revoke all")
+    assert env.store.get(first) is RequestState.REVOKED
+    assert env.store.get(second) is RequestState.REVOKED
+
+    bulk = [r for r in _audit_records(tmp_path / "audit.jsonl") if r.get("reason") == "revoke_all"]
+    assert {r["grant_id"] for r in bulk} == {first, second}
+    assert all(r["grant_id"] != 0 for r in bulk)
+
+
+async def test_approve_audit_entry_is_durable_before_the_cas(env: Env, tmp_path: Path):
+    """P10/A1 write-before-operate, proven from the inside: at the moment
+    the store is asked to widen, the chain already carries the approval
+    entry for that request (audit.record(then=store.approve))."""
+    number = env.submit()
+    await env.core.notify_request(number, "j", [ITEM])
+
+    seen: dict[str, list[dict]] = {}
+    original = env.store.approve
+
+    def spy(rid, duration=None):
+        seen["records"] = _audit_records(tmp_path / "audit.jsonl")
+        return original(rid, duration=duration)
+
+    env.store.approve = spy  # type: ignore[method-assign]
+    try:
+        await env.core.handle_reply(APPROVER, f"approve {number}")
+    finally:
+        env.store.approve = original
+
+    assert any(
+        r["decision"] == "approved" and r["grant_id"] == number
+        for r in seen["records"]
+    ), seen["records"]
+    assert env.store.get(number) is RequestState.ACTIVE

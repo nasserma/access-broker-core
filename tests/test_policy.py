@@ -229,10 +229,6 @@ def test_all_gated_ops_allow_when_listed() -> None:
 # --------------------------------------------------- basics: DENY
 
 
-def test_empty_grant_list_denies_everything() -> None:
-    pass  # single-grant checker: covered by not-in-scope tests below
-
-
 def test_request_outside_scope_denied() -> None:
     d = check(grant(resource="Work"), request(resource="Photos"), static_clock)
     assert d == Decision(False, Reason.NOT_IN_SCOPE)

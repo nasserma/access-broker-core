@@ -13,6 +13,18 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+      # P6: over half of this suite (274 of 506 test functions) imports the
+      # groupware sibling through tests/_gw_path.py and SKIPPED in CI, so
+      # the deny-by-default wall and the approval plane were demonstrated
+      # by nothing the published pipeline ran. Check the sibling out and
+      # point GROUPWARE_PATH at it. Set the repo variable GROUPWARE_REPO if
+      # the sibling lives elsewhere (or is private and needs a token).
+      - name: Checkout the sibling broker (parity batteries)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GROUPWARE_REPO || format('{0}/groupware-access-broker', github.repository_owner) }}
+          path: .siblings/groupwareAccessBroker
+        continue-on-error: true
       - uses: astral-sh/setup-uv@v4
         with:
           python-version: ${{ matrix.python-version }}
@@ -21,6 +33,18 @@ jobs:
       - name: Ruff
         run: uv run ruff check .
       - name: Tests with coverage (100% stmt+branch on the wall components)
-        run: uv run pytest -q --cov=access_broker_core --cov-branch --cov-report=term-missing
-      - name: Coverage gate
-        run: uv run pytest -q --cov=access_broker_core --cov-branch --cov-fail-under=100 2>/dev/null || uv run coverage report --fail-under=100
+        env:
+          GROUPWARE_PATH: ${{ github.workspace }}/.siblings/groupwareAccessBroker
+        run: |
+          set -o pipefail
+          uv run pytest -q -rs --cov=access_broker_core --cov-branch \
+            --cov-report=term-missing --cov-fail-under=100 | tee pytest.log
+      # The gate cannot be earned by skipping: a pipeline that proves 46% of
+      # the package must fail, not report 100%.
+      - name: Parity batteries must RUN (no silent skips)
+        run: |
+          if grep -Eq '[0-9]+ skipped' pytest.log; then
+            echo "::error::parity batteries were SKIPPED: set vars.GROUPWARE_REPO, or make the sibling checkout reachable, so GROUPWARE_PATH resolves."
+            grep -E 'SKIPPED|skipped' pytest.log || true
+            exit 1
+          fi

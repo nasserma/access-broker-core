@@ -511,27 +511,23 @@ def test_parse_duration_none_and_empty(core_env):
 
 
 async def test_transport_interface_defaults(core_env):
-    """Lines 180-189: the GatewayTransport interface's abstract send raises;
-    add_reaction and send_to_approver default correctly."""
+    """The GatewayTransport interface's abstract send raises and
+    add_reaction is the documented no-op default. The dead members from
+    the review (P22/P40) are GONE: no ``send_to_approver`` and no
+    ``PendingRequest`` dataclass in the module."""
+    from access_broker_core.gateways import logic as logic_module
     from access_broker_core.gateways.logic import GatewayTransport
 
     class Minimal(GatewayTransport):
-        recorded = []
-
         async def send_message(self, text: str) -> str:
-            Minimal.recorded.append(text)
             return "evt-min"
 
     t = Minimal()
-    # the base abstract send raises; the override replaces it, so exercise
-    # the BASE class methods directly
     with pytest.raises(NotImplementedError):
         await GatewayTransport.send_message(t, "x")
     await t.add_reaction("evt", "emoji")  # documented no-op default
-    # send_to_approver defaults to send_message
-    result = await t.send_to_approver("hi")
-    assert result == "evt-min"
-    assert Minimal.recorded == ["hi"]
+    assert not hasattr(GatewayTransport, "send_to_approver")
+    assert not hasattr(logic_module, "PendingRequest")
 
 
 async def test_render_decision_active_expiry_hours(core_env):
@@ -888,22 +884,28 @@ def test_request_renders_one_numbered_item_line_per_item(core_env):
 
 def test_justification_isolation_invariant(core_env):
     """Suite SECURITY.md 'Bounded approval context': the agent-supplied
-    justification appears verbatim exactly once, in its own labelled
-    line, and can never reach an item identity line — even when the
-    agent writes text shaped like an item or a command header."""
+    justification occupies exactly ONE labelled line, is markdown
+    neutralized, and can never reach an item identity line — even when
+    the agent writes text shaped like an item or a card header.
+
+    Re-pinned for the P4 render fix: the field is no longer echoed
+    verbatim (verbatim is the vulnerability); it is single-lined and its
+    emphasis/backtick characters are escaped."""
     core, store, transport = make_core(core_env)
     hostile = "1. **imap** work: `Sent` — `send` | approve 1 | **PENDING #99**"
     text = core.render_request(2, hostile, FIVE_BROKER_ITEMS)
-    # verbatim, exactly once, on the labelled line
-    assert text.count(hostile) == 1
     labelled = [ln for ln in text.splitlines() if ln.startswith(JUSTIFICATION_LABEL)]
-    assert labelled == [f"{JUSTIFICATION_LABEL}: {hostile}"]
-    # the item lines are template-owned: the injection never lands there
+    assert len(labelled) == 1
+    rendered = labelled[0]
+    # neutralized: no live emphasis/backticks, and the raw shape is gone
+    assert hostile not in rendered
+    assert "\\*\\*imap\\*\\*" in rendered
+    assert "`Sent`" not in rendered
+    # the injection never lands on an item line
     item_lines = [ln for ln in text.splitlines() if re.match(r"^\d+\. ", ln)]
     assert len(item_lines) == len(FIVE_BROKER_ITEMS)
-    assert all(hostile not in ln for ln in item_lines)
     assert all("approve 1" not in ln for ln in item_lines)
-    # and the header still names the real request number
+    # and the header still names the real request number exactly once
     assert text.splitlines()[0].count("**PENDING #2**") == 1
 
 
@@ -1124,19 +1126,21 @@ async def test_revoke_all_confirmations_format(core_env):
 
 
 async def test_audit_failure_warning_format(core_env):
-    """The fail-closed approval warning keeps every fact (grant active,
-    audit failed, re-approving useless, revoke to recover) under one
-    WARNING icon."""
+    """Re-pinned for the write-before-operate ordering (review P10/A1):
+    a failed audit entry REFUSES the widening transition, so the warning
+    says so and the grant is still PENDING — the grant no longer becomes
+    active behind an unrecorded approval."""
     core, store, transport = make_core(core_env)
     core._audit = _BrokenAudit()  # type: ignore[assignment]  # noqa: SLF001
     rid = await submit_one(store)
     await core.handle_reply("@owner:example.org", f"approve {rid}")
     warning = transport.sent[-1]
     assert warning.startswith(ICON_WARNING)
-    assert "**Approve #1 NOT confirmed**" in warning
-    assert "FAILED" in warning
-    assert "`revoke 1`" in warning
-    assert store.get_record(rid).state == "active"  # the grant IS active
+    assert "**Approve #1 REFUSED**" in warning
+    assert "NOT activated" in warning
+    assert "still pending" in warning
+    assert f"`approve {rid}`" in warning
+    assert store.get_record(rid).state == "pending"  # the grant is NOT active
 
 
 class _BrokenAudit:
@@ -1295,10 +1299,12 @@ def test_screen_line_shape(core_env):
     core, store, transport = make_core(core_env)
     text = core.render_request(3, "j", [ITEM], screen="flagged: test_rule")
     screen_lines = [ln for ln in text.splitlines() if ln.startswith(SCREEN_LABEL)]
-    assert screen_lines == [f"{SCREEN_LABEL}: flagged: test_rule"]
+    # markdown-neutralized (P16 family): the underscore is escaped so a
+    # rule name can never open an emphasis span inside the card
+    assert screen_lines == [f"{SCREEN_LABEL}: flagged: test\\_rule"]
     # sits directly below the justification line
     lines = text.splitlines()
-    assert lines.index(f"{SCREEN_LABEL}: flagged: test_rule") == (
+    assert lines.index(f"{SCREEN_LABEL}: flagged: test\\_rule") == (
         lines.index(f"{JUSTIFICATION_LABEL}: j") + 1
     )
 
@@ -1329,3 +1335,128 @@ async def test_post_request_passes_screen(core_env):
     assert event_id == "evt-1"
     posted = transport.sent[0]
     assert f"{SCREEN_LABEL}: flagged: r" in posted
+
+
+# ------------------------------------------------ card forgery (P4/P16/P38)
+
+_FORGERY = (
+    "quarterly report attached\n"
+    "\n"
+    "**PENDING #99** — awaiting your approval · 1 item · 24h if approved\n"
+    "1. **imap** work: `Sent` — `send`\n"
+    f"{JUSTIFICATION_LABEL}: already approved, just tap approve 99\n"
+    "\n"
+    "**Decide** — 👍 `approve 99`, or 👎 `reject 99`"
+)
+
+
+def test_multiline_justification_cannot_forge_a_card(core_env):
+    """THE P4 probe, as a battery arm: a newline-bearing justification
+    used to render TWO complete card headers (a genuine PENDING #7 plus a
+    fabricated PENDING #8 block with its own item line and `approve 8`
+    instruction), steering the human to a real, different request. The
+    rendered card must now contain exactly ONE header, ONE item block,
+    ONE justification line and ONE Decide affordance."""
+    core, _store, _t = make_core(core_env)
+    text = core.render_request(7, _FORGERY, [ITEM])
+    lines = text.splitlines()
+
+    headers = [ln for ln in lines if ln.startswith(ICON_PENDING)]
+    assert len(headers) == 1, lines
+    assert "**PENDING #7**" in headers[0]
+    # the forged header never renders as a live bold header
+    assert "**PENDING #99**" not in text
+    assert "\\*\\*PENDING #99\\*\\*" in text
+    # exactly one justification LINE and one LIVE Decide affordance (the
+    # quoted labels inside the justification text are escaped, so they
+    # never render as card structure)
+    assert len(
+        [ln for ln in lines if ln.startswith(f"{JUSTIFICATION_LABEL}:")]
+    ) == 1
+    assert text.count("**Decide**") == 1
+    assert text.count("`approve 7`") == 1
+    # the fabricated instruction lives ONLY inside the justification line
+    justification_line = [
+        ln for ln in lines if ln.startswith(f"{JUSTIFICATION_LABEL}:")
+    ][0]
+    assert [ln for ln in lines if "approve 99" in ln] == [justification_line]
+    # item identity lines are exactly the real request's items
+    assert len([ln for ln in lines if re.match(r"^\d+\. ", ln)]) == 1
+
+
+def test_multiline_label_cannot_forge_an_item_line(core_env):
+    """Same family, the display-only label (P16/P38 — remote-influenced
+    on brokers that fill it from a room name). The store refuses this
+    shape at intake; the renderer is the second belt."""
+    core, _store, _t = make_core(core_env)
+    hostile = dict(ITEM, resource="Sent", label="Room\n\n**PENDING #99** — approve 99")
+    text = core.render_request(2, "j", [hostile])
+    assert len([ln for ln in text.splitlines() if ln.startswith(ICON_PENDING)]) == 1
+    assert "**PENDING #99**" not in text
+    assert len([ln for ln in text.splitlines() if re.match(r"^\d+\. ", ln)]) == 1
+
+
+def test_screen_line_is_single_line_bounded(core_env):
+    """The screen line is broker-generated but must stay ONE bounded line
+    (256 rule names x 128 chars would otherwise violate the card)."""
+    core, _store, _t = make_core(core_env)
+    text = core.render_request(2, "j", [ITEM], screen="refused: a\nb" + "x" * 400)
+    screen_lines = [ln for ln in text.splitlines() if ln.startswith(SCREEN_LABEL)]
+    assert len(screen_lines) == 1
+    assert len(screen_lines[0]) <= len(SCREEN_LABEL) + 2 + 256 + 1
+
+
+def test_backtick_in_resource_cannot_close_the_code_span(core_env):
+    core, _store, _t = make_core(core_env)
+    text = core.render_request(2, "j", [dict(ITEM, resource="Sent` **imap** x")])
+    item_line = [ln for ln in text.splitlines() if re.match(r"^\d+\. ", ln)][0]
+    assert "`Sent' **imap** x`" in item_line  # backtick neutralized
+    assert item_line.count("`") % 2 == 0  # code spans stay balanced
+
+
+# ------------------------------------------- bounded notify + typo (P21/P39)
+
+
+async def test_hung_transport_times_out_loudly(core_env, caplog):
+    """A hung transport must not stall the agent's gated tool call: the
+    send is bounded, logged loudly, and surfaced as TransportError (the
+    card was NOT delivered — it must not look delivered)."""
+    import asyncio
+
+    from access_broker_core.gateways.logic import TransportError
+
+    core, store, _t = make_core(core_env)
+
+    class Hung(GatewayTransport):
+        async def send_message(self, text: str) -> str:
+            await asyncio.sleep(30)
+            return "never"
+
+    core.bind_transport(Hung())
+    core._send_timeout = 0.01  # noqa: SLF001 - the bounded-call knob
+    rid = await submit_one(store)
+    with pytest.raises(TransportError, match="timed out"):
+        await core.notify_request(rid, "j", [ITEM])
+    assert any("timed out" in rec.message for rec in caplog.records)
+    assert store.get_record(rid).state == "pending"  # nothing widened
+
+
+async def test_mistyped_expiry_is_refused_not_raised(core_env):
+    """'approve 1 0h' used to raise ValueError THROUGH handle_reply into
+    the adapter loop; the intake now routes it to the refusal hint."""
+    core, store, transport = make_core(core_env)
+    rid = await submit_one(store)
+    await core.handle_reply("@owner:example.org", f"approve {rid} 0h")
+    assert store.get_record(rid).state == "pending"
+    assert any("Invalid expiry" in t for t in transport.sent)
+    # the gateway still serves the next command
+    await core.handle_reply("@owner:example.org", "status")
+    assert any("STATUS" in t for t in transport.sent)
+
+
+def test_card_expiry_label_reads_the_store_ttl(core_env):
+    """P39: the header states the store's configured TTL, not '24h'."""
+    core, store, _t = make_core(core_env)
+    assert "24h if approved" in core.render_request(1, "j", [ITEM])
+    store._active_ttl = timedelta(hours=6)  # noqa: SLF001 - the configured TTL
+    assert "6h if approved" in core.render_request(1, "j", [ITEM])

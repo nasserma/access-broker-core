@@ -31,9 +31,11 @@ Vocabulary rework for the PIM domain (per S5 design note rev 2):
   store as normalized timedeltas (store contract: grammar lives in the
   gateway, not the store).
 
-Canonical emoji set (one grammar across all four gateways; transports
-without native reactions still post the four controls as text lines):
-approve 👍, reject 👎, revoke ⛔, status 📋.
+Canonical emoji set (one grammar across all four gateways; a transport
+without native reactions still accepts typed commands — the typed
+grammar is the only decision door, and there is deliberately no
+text-line control fallback: an unclickable "approve" line inside a bot
+message would be indistinguishable from agent-influenced card text).
 
 Message format contract (2026-09-29 suite-wide render pass; the format
 IS the suite's format because all five brokers render through this
@@ -53,6 +55,12 @@ module):
   ("Justification (agent, unverified):") and never reaches the item
   identity lines or the pre-placed reactions (suite SECURITY.md,
   "Bounded approval context").
+- Agent-influenced fields are SINGLE-PHYSICAL-LINE at render: control
+  characters, newlines and Unicode line separators are collapsed, and
+  markdown emphasis/backticks are escaped (review P4/P16/P38 — a
+  newline-bearing justification could otherwise forge a second card
+  header and steer a typed ``approve N`` to a different request).
+  The store refuses the same shapes at intake; this is the second belt.
 - Matrix-safe markdown only: bold, inline code, bullets and em dashes.
   No tables (Element X collapses them), no nested emphasis.
 """
@@ -61,15 +69,16 @@ module):
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import cast
 
 from access_broker_core.audit import AuditLog, LogWriteError
-from access_broker_core.grants import GrantStore, RejectReason, RequestState
+from access_broker_core.grants import GrantRecord, GrantStore, RejectReason, RequestState
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +95,50 @@ request as a NEW pending request (never resurrects the decided number).
 Deliberately short; restarts close all windows (fail closed)."""
 
 DEFAULT_EXPIRY_LABEL = "24h"
+"""Fallback expiry label, used ONLY when the store does not expose its
+configured active TTL. The card reads ``GrantStore.active_ttl`` so a
+broker that configures a different TTL never renders a lying card
+(review P39)."""
+
+DEFAULT_SEND_TIMEOUT_SECONDS = 10.0
+"""Bounded transport call (review P21): ``notify_request`` runs INLINE
+inside the agent's gated tool call, so a hung transport must never
+stall it. Overridable per gateway via ``send_timeout_seconds``."""
+
+_MAX_JUSTIFICATION_RENDER = 512
+_MAX_LABEL_RENDER = 128
+_MAX_SCREEN_RENDER = 256
+_MAX_ECHO_RENDER = 64
+
+#: Every character a transport may treat as a line break, or that
+#: renders as an invisible control inside a bot-authored card.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+#: Markdown constructs an agent-influenced field could use to fake
+#: emphasis, code, links or strikethrough inside the card.
+_MARKDOWN_CHARS = str.maketrans({c: "\\" + c for c in "*_`~[]"})
+
+
+def _one_line(value: object, limit: int | None = None) -> str:
+    """Collapse a value to ONE physical line (controls -> spaces)."""
+    text = _CONTROL_CHARS.sub(" ", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    if limit is not None and len(text) > limit:
+        text = text[: max(1, limit - 1)] + "…"
+    return text
+
+
+def _safe_text(value: object, limit: int | None = None) -> str:
+    """One line + markdown-neutralized: the form for agent/remote free
+    text rendered OUTSIDE inline code (justification, label, screen)."""
+    return _one_line(value, limit).translate(_MARKDOWN_CHARS)
+
+
+def _code_text(value: object, limit: int = 256) -> str:
+    """One line + backtick-safe: the form for a value rendered INSIDE an
+    inline code span (a backtick would close the span and let the tail
+    render as markdown)."""
+    return _one_line(value, limit).replace("`", "'")
 
 # Decision verbs -> the reaction emoji that produced them. Built from
 # DECISION_EMOJIS so the confirmation header always shows the control
@@ -183,8 +236,17 @@ _COMMANDS = ("approve", "reject", "revoke", "undo", "status")
 # gateway answers; a refusal from the wrong one is noise). The prefix is
 # also stamped on every outbound message so the human can tell which
 # broker is speaking when several share one @identity.
+COMMAND_PREFIX_PATTERN = r"[a-z][a-z0-9_-]{0,31}"
+"""The shape a broker tag must have. It is the FIRST group of the
+inbound shared-room regex below, so a prefix outside this shape could
+never be matched from an inbound line (review P30: an uppercase or
+space-bearing prefix silently disabled every typed command). The
+factory refuses such a prefix at boot."""
+
+COMMAND_PREFIX_RE = re.compile(rf"^{COMMAND_PREFIX_PATTERN}$")
+
 _COMMAND_PREFIX_RE = re.compile(
-    r"^([a-z][a-z0-9_-]{0,31})\s+(.+)$", re.DOTALL | re.IGNORECASE
+    rf"^({COMMAND_PREFIX_PATTERN})\s+(.+)$", re.DOTALL | re.IGNORECASE
 )
 
 _DURATION_RE = re.compile(r"^(\d{1,3})([hmd])$", re.IGNORECASE)
@@ -251,19 +313,11 @@ def format_remaining(delta: timedelta) -> str:
     return f"{seconds // 60}m"
 
 
-@dataclass
-class PendingRequest:
-    """Gateway-side view of one posted (or unposted) pending request."""
-
-    request_number: int
-    justification: str
-    items: list[dict]
-    created_at: datetime = field(default_factory=datetime.now)
-
-
 class TransportError(Exception):
     """Raised by transports on delivery failure; the gateway fails closed
-    (the request stays pending; a notice is attempted on the next event)."""
+    (the request stays pending; a notice is attempted on the next event).
+    Also raised when a transport call exceeds the gateway's bounded send
+    timeout — a hung approval transport must not stall the agent."""
 
 
 class GatewayTransport:
@@ -278,11 +332,6 @@ class GatewayTransport:
     async def add_reaction(self, event_id: str, emoji: str) -> None:
         """Pre-place a decision reaction on a posted message. Transports
         without native reactions implement this as a no-op."""
-
-    async def send_to_approver(self, text: str) -> str:
-        """Direct-to-approver channel (1:1 chat) when the room is not the
-        approval surface. Default: same as send_message."""
-        return await self.send_message(text)
 
 
 class ApprovalGatewayCore:
@@ -308,30 +357,36 @@ class ApprovalGatewayCore:
         transport: GatewayTransport,
         approver: str,
         now: Callable[[], datetime],
-        surface: str = "approvals",
         audit: AuditLog | None = None,
         shared_room: bool = False,
         command_prefix: str | None = None,
+        send_timeout_seconds: float = DEFAULT_SEND_TIMEOUT_SECONDS,
     ) -> None:
         """store: the GrantStore all decisions route through.
         transport: the gateway's I/O shell. approver: the single
         allowlisted sender identity on THIS gateway (platform-specific
         shape; Matrix user id, Telegram user id, Teams AAD object id,
         signal number/uuid). Messages from any other sender are ignored
-        silently. now: injected clock. surface: platform destination
-        identifier (room id / chat id / conversation id) — for logging
-        and adapter use; the core never addresses a second surface.
-        audit: the broker's AuditLog. When present, every HUMAN decision
-        (submit, approve, reject, revoke, undo) is written into the
-        hash-chained audit log with the approver identity — the audit
-        record of owner decisions is a suite invariant (adversarial
-        review finding F1, 2026-09-16). When None (tests, headless
-        deployments) decision entries are skipped, as before."""
+        silently. now: injected clock. audit: the broker's AuditLog.
+        When present, every HUMAN decision (approve, reject, revoke,
+        undo) and the agent's submission is written into the
+        hash-chained audit log — the audit record of owner decisions is
+        a suite invariant (adversarial review finding F1, 2026-09-16).
+        When None (tests, headless deployments) decision entries are
+        skipped; ``build_gateway`` refuses an audit-less boot unless
+        ``allow_without_audit`` is set explicitly (review P29).
+        send_timeout_seconds: bounded transport call (review P21).
+
+        Construction wiring: the transport is normally bound by the
+        adapter builder before the gateway starts; ``bind_transport``
+        is the public rebind the factory uses after the builder returns
+        (review P15/P40 — the previous contract expected a private
+        attribute assignment and could leave the core unable to send).
+        """
         self._store = store
         self._transport = transport
         self._approver = approver
         self._now = now
-        self._surface = surface
         self._audit = audit
         self._event_to_request: dict[str, int] = {}
         self._swept: set[int] = set()
@@ -341,10 +396,95 @@ class ApprovalGatewayCore:
                 "gateway shared_room=True requires a command_prefix "
                 "(the tag this gateway answers to and stamps on outbound messages)"
             )
+        if isinstance(send_timeout_seconds, bool) or not isinstance(
+            send_timeout_seconds, (int, float)
+        ) or send_timeout_seconds <= 0:
+            raise ValueError(
+                f"send_timeout_seconds must be a positive number, got {send_timeout_seconds!r}"
+            )
+        self._send_timeout = float(send_timeout_seconds)
         self._shared_room = bool(shared_room)
         self._prefix = command_prefix if command_prefix else ""
 
+    # ------------------------------------------------------- wiring contract
+
+    def bind_transport(self, transport: GatewayTransport) -> None:
+        """Bind the adapter's real transport (public construction seam)."""
+        if transport is None:
+            raise ValueError("gateway core: transport must not be None")
+        self._transport = transport
+
+    @property
+    def transport(self) -> GatewayTransport:
+        """The transport the core currently sends through."""
+        return self._transport
+
+    @property
+    def has_live_transport(self) -> bool:
+        """False while the core still carries the factory placeholder
+        (a builder that wired nothing). The factory refuses to return
+        such a gateway: it looks healthy and cannot send."""
+        return self._transport is not None and not getattr(
+            self._transport, "IS_PLACEHOLDER", False
+        )
+
     # ------------------------------------------------------------ audit
+
+    def _audit_entry(
+        self,
+        rid: int,
+        decision: str,
+        reason: str,
+        principal: str,
+        items: list[dict] | None = None,
+        then: Callable[[], object] | None = None,
+    ) -> object:
+        """Record one lifecycle entry per ITEM in the audit chain.
+
+        ``principal`` names who acted: ``agent`` for the submission (the
+        agent authored the request — review P27: the old code credited
+        the human), ``approver:<sender>`` for every human decision.
+
+        Every item is recorded (review P26): one entry per item, so a
+        multi-item approval is reconstructable from the chain instead of
+        summarizing only ``items[0]``. ``then`` rides the LAST entry, so
+        the write-before-operate contract holds for the whole decision:
+        the transition runs only after every entry is durable.
+
+        With no audit log configured this is a pass-through to ``then``
+        (headless/test mode; ``build_gateway`` refuses that boot unless
+        it is explicit). Raises LogWriteError on write failure.
+        """
+        if self._audit is None:
+            return then() if then is not None else None
+        rows = [item for item in (items or []) if isinstance(item, dict)]
+        if not rows:
+            return self._audit.record(
+                account="",
+                resource="",
+                operation="lifecycle",
+                grant_id=rid,
+                decision=decision,
+                reason=reason,
+                principal=principal,
+                then=then,
+            )
+        result: object = None
+        last = len(rows) - 1
+        for index, item in enumerate(rows):
+            ops = item.get("ops")
+            result = self._audit.record(
+                account=str(item.get("account", "")),
+                resource=str(item.get("resource", "")),
+                operation=",".join(sorted(str(op) for op in (ops or []))) or "lifecycle",
+                grant_id=rid,
+                decision=decision,
+                reason=reason,
+                backend=item.get("backend"),
+                principal=principal,
+                then=then if index == last else None,
+            )
+        return result
 
     def _audit_decision(
         self,
@@ -353,29 +493,16 @@ class ApprovalGatewayCore:
         reason: str,
         sender: str,
         items: list[dict] | None = None,
-    ) -> None:
-        """Record one human decision in the audit chain.
-
-        Entries carry the approver identity in ``principal`` — the human
-        is an audit principal, not an anonymous actor. Item scope is
-        summarized from the FIRST item (the store's items are the
-        authority; the audit entry is the evidence of WHO decided and
-        WHAT was decided on). Raises LogWriteError on write failure;
-        callers on a state-WIDENING path (approve, undo-recreate) must
-        fail closed, others log and proceed (mirrors tools.py).
-        """
-        if self._audit is None:
-            return
-        first = (items or [{}])[0]
-        self._audit.record(
-            account=str(first.get("account", "")),
-            resource=str(first.get("resource", "")),
-            operation=",".join(sorted(first.get("ops", []))) or "lifecycle",
-            grant_id=rid,
-            decision=decision,
-            reason=reason,
-            backend=first.get("backend"),
-            principal=f"approver:{sender}",
+        then: Callable[[], object] | None = None,
+    ) -> object:
+        """One APPROVER decision: principal is ``approver:<sender>``."""
+        return self._audit_entry(
+            rid,
+            decision,
+            reason,
+            f"approver:{sender}",
+            items=items,
+            then=then,
         )
 
     # ------------------------------------------------------------- posting
@@ -384,11 +511,16 @@ class ApprovalGatewayCore:
     def _item_resource_display(item: dict) -> str:
         """Display form of one grant item's resource: the human label
         when present (e.g. Matrix room name), else the raw resource.
-        Matching never uses this — item['resource'] stays the wall key."""
+        Matching never uses this — item['resource'] stays the wall key.
+        Both parts are neutralized to one physical line: the label is
+        remote-influenced on some brokers (a room name an admin sets)
+        and the resource is agent-influenced (review P16/P38/P4)."""
         label = item.get("label")
-        if isinstance(label, str) and label and label != item["resource"]:
-            return f"{label} (`{item['resource']}`)"
-        return f"`{item['resource']}`"
+        resource = str(item.get("resource", ""))
+        safe_resource = _code_text(resource, 256)
+        if isinstance(label, str) and label and label != resource:
+            return f"{_safe_text(label, _MAX_LABEL_RENDER)} (`{safe_resource}`)"
+        return f"`{safe_resource}`"
 
     def _item_line(self, item: dict, index: int | None = None) -> str:
         """ONE template-controlled item identity line.
@@ -401,10 +533,10 @@ class ApprovalGatewayCore:
         invariant. ``index`` numbers request items (1., 2., ...); the
         other renders bullet them.
         """
-        ops = ", ".join(f"`{op}`" for op in sorted(item.get("ops", [])))
+        ops = ", ".join(f"`{_code_text(op, 64)}`" for op in sorted(item.get("ops", [])))
         marker = f"{index}." if index is not None else BULLET
         return (
-            f"{marker} **{item['backend']}** {item['account']}:"
+            f"{marker} **{_one_line(item['backend'], 64)}** {_one_line(item['account'], 128)}:"
             f" {self._item_resource_display(item)} — {ops}"
         )
 
@@ -431,17 +563,25 @@ class ApprovalGatewayCore:
         target. screen: optional bounded verdict line from the content
         screen (design note 2026-10-01), rendered directly below the
         justification; None = no screen ran and the card is
-        byte-identical to the pre-screening card."""
+        byte-identical to the pre-screening card.
+
+        The justification, the item labels and the screen line are each
+        emitted as ONE physical line with markdown neutralized (review
+        P4/P16/P38): a newline-bearing value can no longer forge a
+        second card header, an item block or a ``Decide`` affordance.
+        """
         count = len(items)
         lines = [
             f"{ICON_PENDING} **PENDING #{number}** — awaiting your approval"
             f" · {count} item{'s' if count != 1 else ''} ·"
-            f" {DEFAULT_EXPIRY_LABEL} if approved",
+            f" {self._expiry_label()} if approved",
         ]
         lines += [self._item_line(item, i) for i, item in enumerate(items, start=1)]
-        lines += [f"{JUSTIFICATION_LABEL}: {justification}"]
+        lines += [
+            f"{JUSTIFICATION_LABEL}: {_safe_text(justification, _MAX_JUSTIFICATION_RENDER)}"
+        ]
         if screen is not None:
-            lines.append(f"{SCREEN_LABEL}: {screen}")
+            lines.append(f"{SCREEN_LABEL}: {_safe_text(screen, _MAX_SCREEN_RENDER)}")
         lines += [
             "",
             f"**Decide** — {APPROVE_EMOJI} `approve {number}`, or"
@@ -450,6 +590,15 @@ class ApprovalGatewayCore:
             f"(react below: {APPROVE_EMOJI} {REJECT_EMOJI} {REVOKE_EMOJI} {STATUS_EMOJI})",
         ]
         return "\n".join(lines)
+
+    def _expiry_label(self) -> str:
+        """The default approval TTL as rendered on the card, read from
+        the store's configuration (review P39: the old hardcoded '24h'
+        misstated any broker with a different TTL)."""
+        ttl = getattr(self._store, "active_ttl", None)
+        if not isinstance(ttl, timedelta):
+            return DEFAULT_EXPIRY_LABEL
+        return format_remaining(ttl)
 
     async def post_request(
         self,
@@ -464,12 +613,29 @@ class ApprovalGatewayCore:
         posted event id. The event→request mapping is in-memory only —
         sound because the store rejects all pending requests at restart,
         so post-restart reactions resolve to nothing. screen: optional
-        screen verdict line (render_request)."""
+        screen verdict line (render_request).
+
+        The reaction pre-placement is best-effort and BOUNDED (review
+        P21): a hung reaction call degrades to typed commands, it does
+        not stall the agent's tool call.
+        """
         event_id = await self._post(
             self.render_request(number, justification, items, screen=screen)
         )
         for emoji in DECISION_EMOJIS:
-            await self._transport.add_reaction(event_id, emoji)
+            try:
+                await asyncio.wait_for(
+                    self._transport.add_reaction(event_id, emoji),
+                    timeout=self._send_timeout,
+                )
+            except TimeoutError:
+                logger.error(
+                    "gateway: add_reaction timed out after %ss on %s; "
+                    "the card stands, typed commands remain available",
+                    self._send_timeout,
+                    event_id,
+                )
+                break
         self._event_to_request[event_id] = number
         return event_id
 
@@ -483,10 +649,11 @@ class ApprovalGatewayCore:
     ) -> str:
         """Public entry point: render + post one pending request.
 
-        The submission decision is audited here (human-plane view of
-        the agent's submit; agent-side ``submitted`` entries come from
-        tools.py). Audit-write failure does NOT un-post the request —
-        the submission is non-widening — but is surfaced loudly.
+        The submission is audited here with ``principal=agent`` — the
+        agent authored the request, not the human (review P27; the old
+        entry credited the approver). Audit-write failure does NOT
+        un-post the request — the submission is non-widening — but is
+        surfaced loudly.
 
         screen (keyword-only, content-screening design note
         2026-10-01): the screening verdict line rendered next to the
@@ -496,8 +663,12 @@ class ApprovalGatewayCore:
         invariant).
         """
         try:
-            self._audit_decision(
-                request_number, "submitted", "pending_approval", self._approver, items
+            self._audit_entry(
+                request_number,
+                "submitted",
+                "pending_approval",
+                "agent",
+                items,
             )
         except LogWriteError as exc:
             logger.error(
@@ -537,7 +708,14 @@ class ApprovalGatewayCore:
     async def handle_reply(self, sender: str, text: str) -> None:
         """Route a typed command ('approve 47 8h', 'reject 47', 'revoke
         47', 'revoke all', 'undo 47', 'status') — allowlist first, then
-        shared-room prefix routing."""
+        shared-room prefix routing.
+
+        The duration grammar is parsed defensively: a mistyped expiry
+        ('approve 1 0h') used to raise ValueError straight through the
+        adapter's event loop (review, sixth pass). It now routes to the
+        refusal hint, so the human gets a teaching message and the
+        gateway keeps running.
+        """
         if sender != self._approver:
             return
         if self._shared_room:
@@ -545,7 +723,19 @@ class ApprovalGatewayCore:
             if routed is None:
                 return  # another broker's command; the right gateway answers
             text = routed
-        parsed = parse_reply(text)
+        try:
+            parsed = parse_reply(text)
+        except ValueError as exc:
+            logger.warning(
+                "gateway: unparseable command from approver (%s): %r", exc, text
+            )
+            await self._post(
+                f"{ICON_UNKNOWN_COMMAND} **Invalid expiry** in"
+                f" `{_safe_text(text, _MAX_ECHO_RENDER)}` — use a positive"
+                " number with `h`, `m` or `d`, e.g. `approve 3 8h`."
+                " `status` lists every command."
+            )
+            return
         if parsed is None:
             first_word = text.strip().split(" ", 1)[0] if text.strip() else ""
             closest = closest_command(first_word)
@@ -577,8 +767,28 @@ class ApprovalGatewayCore:
 
     async def _post(self, text: str) -> str:
         """The ONE outbound choke point: stamps the broker tag in
-        shared-room mode, then posts through the transport."""
-        return await self._transport.send_message(self._tag(text))
+        shared-room mode, then posts through the transport with a
+        BOUNDED call (review P21).
+
+        The agent's gated tool call awaits this path inline, so a hung
+        transport is capped at ``send_timeout_seconds``: the timeout is
+        logged loudly and surfaced as :class:`TransportError` — a card
+        that was never delivered must not look delivered.
+        """
+        payload = self._tag(text)
+        try:
+            return await asyncio.wait_for(
+                self._transport.send_message(payload), timeout=self._send_timeout
+            )
+        except TimeoutError:
+            logger.error(
+                "gateway: transport send_message timed out after %ss — "
+                "abandoning the post (the approval card was NOT delivered)",
+                self._send_timeout,
+            )
+            raise TransportError(
+                f"gateway transport send timed out after {self._send_timeout}s"
+            ) from None
 
     async def announce_lifecycle(self, state: str) -> None:
         """Post a gateway startup/shutdown notice to the room (owner
@@ -692,49 +902,65 @@ class ApprovalGatewayCore:
         status. No silent decisions; store RejectReason is reported,
         never swallowed."""
         if action == "approve":
-            result = self._store.approve(rid, duration=duration)
-            if isinstance(result, RejectReason):
-                await self._refused(rid, action, result, sender)
-                return
-            # Write-BEFORE-notify: the state-widening decision is in the
-            # audit chain before the human sees its confirmation. A failed
-            # decision entry aborts the approval flow (fail closed): the
-            # grant exists in the store but was never confirmed visibly,
-            # which the approver will notice — the inverse (a confirmed
-            # grant with no audit entry) is the F1 defect class.
             try:
-                self._audit_decision(
-                    rid, "approved", "grant_active", sender, result.items
+                pending = self._store.get_record(rid)
+            except LookupError:
+                await self._refused(rid, action, RejectReason.UNKNOWN_REQUEST, sender)
+                return
+            if pending.state != "pending":
+                await self._refused(rid, action, RejectReason.ALREADY_DECIDED, sender)
+                return
+
+            def _commit() -> object:
+                return self._store.approve(rid, duration=duration)
+
+            # Write-BEFORE-operate (review P10/A1): the approval entry is
+            # durable BEFORE the CAS transition runs, through the audit
+            # module's existing ``then`` seam. A failed audit write means
+            # the store is never asked to widen: the grant does NOT become
+            # active and nothing changed. (A lost CAS race after a
+            # successful entry leaves an intent entry and posts the
+            # store's refusal — the entry records the attempt, which is
+            # the safe direction.)
+            try:
+                result = self._audit_decision(
+                    rid,
+                    "approved",
+                    "grant_active",
+                    sender,
+                    pending.items,
+                    then=_commit,
                 )
             except LogWriteError as exc:
                 logger.error(
                     "AUDIT: approve decision entry for request #%d failed (%s); "
-                    "not confirmed — the grant is ACTIVE in the store; recover "
-                    "with revoke %d",
+                    "the grant was NOT activated (audit write refused the transition)",
                     rid,
                     exc,
-                    rid,
                 )
                 await self._post(
-                    f"{ICON_WARNING} **Approve #{rid} NOT confirmed** — the grant"
-                    " store committed the grant, but its audit entry FAILED."
-                    " Resolve the audit log, then `revoke"
-                    f" {rid}` if this was not intended. (Re-approving will not"
-                    " work.)"
+                    f"{ICON_WARNING} **Approve #{rid} REFUSED** — the audit entry"
+                    " could not be written, so the grant was NOT activated and the"
+                    " request is still pending. Resolve the audit log, then retry"
+                    f" `approve {rid}`."
                 )
                 return
+            if isinstance(result, RejectReason):
+                await self._refused(rid, action, result, sender)
+                return
+            record = cast(GrantRecord, result)
             logger.info(
                 "decision: rid=%d action=approve outcome=granted sender=%s items=%d expiry=%s",
                 rid,
                 sender,
-                len(result.items),
-                result.expires_at,
+                len(record.items),
+                record.expires_at,
             )
             self._event_to_request = {
                 e: n for e, n in self._event_to_request.items() if n != rid
             }
             await self._post(
-                self._compose(self._render_decision(result, "Approved", duration),
+                self._compose(self._render_decision(record, "Approved", duration),
                               self._status_text())
             )
         else:
@@ -744,7 +970,10 @@ class ApprovalGatewayCore:
             # Non-widening (capability only ever shrinks): audit failure
             # is surfaced loudly, the decision stands.
             try:
-                self._audit_decision(rid, "rejected", "rejected_by_approver", sender)
+                self._audit_decision(
+                    rid, "rejected", "rejected_by_approver", sender,
+                    self._store.get_record(rid).items,
+                )
             except LogWriteError as exc:
                 logger.error(
                     "AUDIT: reject decision entry for request #%d failed: %s", rid, exc
@@ -785,15 +1014,17 @@ class ApprovalGatewayCore:
         if not self._store.revoke(rid):
             await self._refused(rid, "revoke", "unknown, decided, or expired", sender)
             return
+        record = self._store.get_record(rid)
         # Non-widening: audit failure surfaced loudly, revocation stands.
         try:
-            self._audit_decision(rid, "revoked", "revoked_by_approver", sender)
+            self._audit_decision(
+                rid, "revoked", "revoked_by_approver", sender, record.items
+            )
         except LogWriteError as exc:
             logger.error(
                 "AUDIT: revoke decision entry for request #%d failed: %s", rid, exc
             )
         logger.info("decision: rid=%d action=revoke outcome=revoked sender=%s", rid, sender)
-        record = self._store.get_record(rid)
         self._arm_undo(rid, record)
         await self._post(
             self._compose(self._render_decision(record, "Revoked", None, undo=True),
@@ -803,20 +1034,30 @@ class ApprovalGatewayCore:
     async def _revoke_many(self, sender: str) -> None:
         """'revoke all': every effective-ACTIVE grant. Revokes one at a
         time through the store, then posts ONE summary. Zero revocations
-        is announced, never silent."""
-        count = self._store.revoke_all()
+        is announced, never silent.
+
+        The audit chain gets ONE addressable entry per revoked grant
+        (review P26: the old synthetic ``grant_id=0`` summary row could
+        not be tied to any grant).
+        """
+        numbers = self._store.revoke_all_grants()
+        count = len(numbers)
         logger.info("decision: action=revoke_all outcome=done sender=%s count=%d", sender, count)
-        if count:
-            # Non-widening: one summary entry for the bulk decision;
-            # individual revocations are traceable via the store + undo
-            # windows; per-id entries would multiply without adding
-            # evidentiary value beyond this one.
+        for rid in numbers:
+            # Non-widening: an audit failure is surfaced loudly and the
+            # revocation stands.
             try:
                 self._audit_decision(
-                    0, "revoked", f"revoke_all ({count} grants)", sender
+                    rid,
+                    "revoked",
+                    "revoke_all",
+                    sender,
+                    self._store.get_record(rid).items,
                 )
             except LogWriteError as exc:
-                logger.error("AUDIT: revoke_all decision entry failed: %s", exc)
+                logger.error(
+                    "AUDIT: revoke_all decision entry for #%d failed: %s", rid, exc
+                )
         if not count:
             await self._post(f"{ICON_REFUSED} Nothing to revoke (all grants).")
             return
@@ -840,7 +1081,11 @@ class ApprovalGatewayCore:
         (the store's authority), never from the request text."""
         head = f"{_VERB_ICONS[verb]} **{verb} #{record.request_number}**"
         if record.state == "active":
-            expiry = format_remaining(duration) + "." if duration else "24h."
+            expiry = (
+                format_remaining(duration) + "."
+                if duration
+                else f"{self._expiry_label()}."
+            )
             head += f" ({expiry})"
         else:
             head += "."
